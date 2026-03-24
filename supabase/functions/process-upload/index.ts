@@ -33,26 +33,58 @@ interface PipelineResult {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function splitIntoPages(text: string): RawPage[] {
-  if (!text?.trim()) return [{ page: 1, text: '' }]
+/** Extract pages from a file. For PDFs uses pdf-parse to get numpages. */
+async function extractPdfPages(fileData: Blob, fileName: string): Promise<{ pageCount: number; pages: RawPage[] }> {
+  const isPdf = fileName.toLowerCase().endsWith('.pdf')
 
-  // Try form-feed splits (real PDFs)
-  const ffPages = text.split('\f').map(t => t.trim()).filter(t => t.length > 10)
-  if (ffPages.length > 1) {
-    return ffPages.map((t, i) => ({ page: i + 1, text: t }))
+  if (isPdf) {
+    try {
+      // Dynamic import — @ts-ignore suppresses the local TS resolver error;
+      // at runtime Deno resolves URL imports correctly.
+      // @ts-ignore: URL import, valid in Deno
+      const { default: pdfParse } = await import('https://esm.sh/pdf-parse@1.1.1')
+      const arrayBuffer = await fileData.arrayBuffer()
+      const buffer = new Uint8Array(arrayBuffer)
+      const data = await pdfParse(buffer)
+
+      const pageCount: number = data.numpages
+      const fullText: string = data.text || ''
+
+      const pages = splitTextByPageCount(fullText, pageCount, fileName)
+      return { pageCount, pages }
+    } catch (err) {
+      console.warn('pdf-parse failed, falling back to text split:', err)
+    }
   }
 
-  // Line-based fallback
+  // Fallback for images or failed PDF parsing: treat the whole file as one page
+  const rawText = await fileData.text().catch(() => `[Nicht lesbar: ${fileName}]`)
+  return { pageCount: 1, pages: [{ page: 1, text: rawText }] }
+}
+
+/** Split a full-document text into individual page objects. */
+function splitTextByPageCount(text: string, pageCount: number, fileName: string): RawPage[] {
+  if (!text?.trim()) {
+    // Scanned PDF — no extractable text, create one placeholder per page
+    return Array.from({ length: pageCount }, (_, i) => ({
+      page: i + 1,
+      text: `[Seite ${i + 1} aus ${fileName} – gescanntes Bild, OCR erforderlich]`,
+    }))
+  }
+
+  // If pdf-parse inserted form-feeds between pages, use those
+  const ffParts = text.split('\f').map(t => t.trim()).filter(t => t.length > 0)
+  if (ffParts.length === pageCount) {
+    return ffParts.map((t, i) => ({ page: i + 1, text: t }))
+  }
+
+  // Otherwise split evenly by line count
   const lines = text.split('\n')
-  if (lines.length <= 50) return [{ page: 1, text }]
-
-  const pageSize = Math.max(30, Math.floor(lines.length / 10))
-  const pages: RawPage[] = []
-  for (let i = 0; i < lines.length; i += pageSize) {
-    const pageText = lines.slice(i, i + pageSize).join('\n').trim()
-    if (pageText.length > 10) pages.push({ page: Math.floor(i / pageSize) + 1, text: pageText })
-  }
-  return pages.length > 0 ? pages : [{ page: 1, text }]
+  const linesPerPage = Math.max(1, Math.ceil(lines.length / pageCount))
+  return Array.from({ length: pageCount }, (_, i) => ({
+    page: i + 1,
+    text: lines.slice(i * linesPerPage, (i + 1) * linesPerPage).join('\n').trim(),
+  }))
 }
 
 function dotProduct(a: number[], b: number[]): number {
@@ -168,13 +200,13 @@ serve(async (req) => {
       .download(filePath)
     if (downloadError) throw downloadError
 
-    const rawText = await fileData.text().catch(() => `[Nicht lesbar: ${fileName}]`)
-    const rawPages = splitIntoPages(rawText)
+    // Use pdf-parse for PDFs to get the correct numpages value
+    const { pageCount, pages: rawPages } = await extractPdfPages(fileData, fileName)
 
-    await supabase.from('raw_scans').update({ page_count: rawPages.length }).eq('id', scanId)
+    await supabase.from('raw_scans').update({ page_count: pageCount }).eq('id', scanId)
 
     // ── Step 1: Analyze each page with Claude Haiku (max 5 parallel) ──────
-    const analyzeTasks = rawPages.map(p => async () => {
+    const analyzeTasks = rawPages.map((p: RawPage) => async () => {
       try {
         return await callFunction('analyze-page', {
           page: p.page,
@@ -194,7 +226,7 @@ serve(async (req) => {
       }
     })
 
-    const analyzedPages = await pLimit(analyzeTasks, 5)
+    const analyzedPages = (await pLimit(analyzeTasks, 5)) as AnalyzedPage[]
 
     // ── Step 2: Intra-document clustering (threshold 0.82) ────────────────
     const pageGroups = clusterByEmbedding(analyzedPages, 0.82)
