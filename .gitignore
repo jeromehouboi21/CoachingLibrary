@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Environment variables — NIEMALS committen!
+.env
+.env.local
+.env.*.local
+
+# Supabase local secrets
+supabase/.temp/
+supabase/functions/**/.env
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.log
+.vscode/settings.json
+
+# Vite / PWA
+*.local
+dev-dist/
+
