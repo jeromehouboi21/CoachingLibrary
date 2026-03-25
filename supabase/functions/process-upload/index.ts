@@ -238,6 +238,8 @@ serve(async (req) => {
     scanId = body.scanId
     const pageCount: number = body.pageCount
 
+    console.log('[process-upload] gestartet', { scanId, pageCount })
+
     if (!scanId || !pageCount) {
       throw new Error('Missing required parameters: scanId, pageCount')
     }
@@ -247,14 +249,19 @@ serve(async (req) => {
       .eq('id', scanId)
 
     // ── Step 1: OCR all PNGs via Google Vision API (max 5 parallel) ──────────
-    const token = await getGoogleAccessToken(
-      Deno.env.get('GOOGLE_CLIENT_EMAIL')!,
-      Deno.env.get('GOOGLE_PRIVATE_KEY')!
-    )
+    console.log('[process-upload] Step 1: Google Access Token holen…')
+    const clientEmail = Deno.env.get('GOOGLE_CLIENT_EMAIL')
+    const privateKey = Deno.env.get('GOOGLE_PRIVATE_KEY')?.replace(/\\n/g, '\n')
+    if (!clientEmail) throw new Error('Secret GOOGLE_CLIENT_EMAIL fehlt')
+    if (!privateKey) throw new Error('Secret GOOGLE_PRIVATE_KEY fehlt')
+
+    const token = await getGoogleAccessToken(clientEmail, privateKey)
+    console.log('[process-upload] Access Token erhalten')
 
     const pageFilenames = Array.from({ length: pageCount }, (_, i) =>
       `page_${String(i + 1).padStart(3, '0')}.png`
     )
+    console.log('[process-upload] Seiten:', pageFilenames)
 
     // Read originalFilename from meta.json for use in analyze-page prompts
     let originalFilename = 'scan.pdf'
@@ -266,28 +273,39 @@ serve(async (req) => {
         const meta = JSON.parse(await metaBlob.text())
         if (meta.originalFilename) originalFilename = meta.originalFilename
       }
-    } catch { /* non-critical */ }
+      console.log('[process-upload] originalFilename:', originalFilename)
+    } catch (metaErr) {
+      console.warn('[process-upload] meta.json nicht lesbar:', metaErr)
+    }
 
+    console.log('[process-upload] Step 1: OCR startet für', pageFilenames.length, 'Seiten…')
     const ocrTasks = pageFilenames.map((filename) => async () => {
       try {
-        return await ocrPageWithVision(supabase, scanId!, filename, token)
+        const text = await ocrPageWithVision(supabase, scanId!, filename, token)
+        console.log(`[process-upload] OCR OK: ${filename} → ${text.length} Zeichen`)
+        return text
       } catch (err) {
-        console.warn(`OCR failed for ${filename}:`, err)
+        console.error(`[process-upload] OCR FEHLER: ${filename}:`, (err as Error).message)
         return `[Seite nicht lesbar: ${filename}]`
       }
     })
 
     const pageTexts: string[] = await pLimit(ocrTasks, 5)
+    console.log('[process-upload] Step 1 abgeschlossen, Texte:', pageTexts.map(t => t.length))
 
     // ── Step 2: Analyze each page text with Claude Haiku (max 5 parallel) ────
+    console.log('[process-upload] Step 2: Haiku-Analyse startet…')
     const analyzeTasks = pageTexts.map((text, i) => async () => {
       try {
-        return await callFunction('analyze-page', {
+        const result = await callFunction('analyze-page', {
           page: i + 1,
           text,
           fileName: originalFilename,
         }) as AnalyzedPage
-      } catch {
+        console.log(`[process-upload] analyze-page OK: Seite ${i + 1} → ${result.topic_label}`)
+        return result
+      } catch (err) {
+        console.error(`[process-upload] analyze-page FEHLER Seite ${i + 1}:`, (err as Error).message)
         return {
           page: i + 1,
           topic_key: `page_${i + 1}`,
@@ -300,9 +318,11 @@ serve(async (req) => {
     })
 
     const analyzedPages = (await pLimit(analyzeTasks, 5)) as AnalyzedPage[]
+    console.log('[process-upload] Step 2 abgeschlossen:', analyzedPages.map(p => p.topic_label))
 
     // ── Step 3: Intra-document clustering (threshold 0.82) ───────────────────
     const pageGroups = clusterByEmbedding(analyzedPages, 0.82)
+    console.log('[process-upload] Step 3: Clustering → ', pageGroups.length, 'Gruppen')
 
     const pipelineResults: PipelineResult[] = pageGroups.map(g => ({
       status: 'processing',
@@ -377,10 +397,11 @@ serve(async (req) => {
     console.error('process-upload error:', error)
 
     if (scanId) {
-      await supabase.from('raw_scans').update({
+      const { error: updateError } = await supabase.from('raw_scans').update({
         status: 'error',
         error_message: (error as Error).message,
-      }).eq('id', scanId).catch(() => {})
+      }).eq('id', scanId)
+      if (updateError) console.error('[process-upload] Status-Update fehlgeschlagen:', updateError.message)
     }
 
     return new Response(
