@@ -8,8 +8,6 @@ const corsHeaders = {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface RawPage { page: number; text: string }
-
 interface AnalyzedPage {
   page: number
   topic_key: string
@@ -31,61 +29,113 @@ interface PipelineResult {
   doc_id?: string
 }
 
+// ─── Google Vision API ────────────────────────────────────────────────────────
+
+/** Exchange a service-account key for a short-lived access token */
+async function getGoogleAccessToken(clientEmail: string, privateKey: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000)
+
+  const header = { alg: 'RS256', typ: 'JWT' }
+  const payload = {
+    iss: clientEmail,
+    scope: 'https://www.googleapis.com/auth/cloud-vision',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now,
+  }
+
+  const b64url = (obj: unknown) =>
+    btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
+
+  const signingInput = `${b64url(header)}.${b64url(payload)}`
+
+  // Parse PEM → DER
+  const pem = privateKey.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, '')
+  const der = Uint8Array.from(atob(pem), c => c.charCodeAt(0))
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'pkcs8',
+    der,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+
+  const sig = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    cryptoKey,
+    new TextEncoder().encode(signingInput)
+  )
+
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
+
+  const jwt = `${signingInput}.${sigB64}`
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    }),
+  })
+
+  const tokenData = await res.json()
+  if (!tokenData.access_token) {
+    throw new Error(`Google auth failed: ${JSON.stringify(tokenData)}`)
+  }
+  return tokenData.access_token
+}
+
+/** Download a page PNG from Storage and run DOCUMENT_TEXT_DETECTION via Vision API */
+async function ocrPageWithVision(
+  supabase: ReturnType<typeof createClient>,
+  scanId: string,
+  pageFilename: string,
+  token: string
+): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from('raw-scans')
+    .download(`${scanId}/${pageFilename}`)
+
+  if (error) throw new Error(`Storage download failed for ${pageFilename}: ${error.message}`)
+
+  const arrayBuffer = await data.arrayBuffer()
+  // Convert to base64 in chunks to avoid call stack overflow on large pages
+  const bytes = new Uint8Array(arrayBuffer)
+  let binary = ''
+  const chunkSize = 8192
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  const base64 = btoa(binary)
+
+  const res = await fetch('https://vision.googleapis.com/v1/images:annotate', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      requests: [{
+        image: { content: base64 },
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+        imageContext: { languageHints: ['de'] },
+      }],
+    }),
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Vision API error for ${pageFilename} (${res.status}): ${text}`)
+  }
+
+  const visionData = await res.json()
+  return visionData.responses[0]?.fullTextAnnotation?.text ?? ''
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Extract pages from a file. For PDFs uses pdf-parse to get numpages. */
-async function extractPdfPages(fileData: Blob, fileName: string): Promise<{ pageCount: number; pages: RawPage[] }> {
-  const isPdf = fileName.toLowerCase().endsWith('.pdf')
-
-  if (isPdf) {
-    try {
-      // Dynamic import — @ts-ignore suppresses the local TS resolver error;
-      // at runtime Deno resolves URL imports correctly.
-      // @ts-ignore: URL import, valid in Deno
-      const { default: pdfParse } = await import('https://esm.sh/pdf-parse@1.1.1')
-      const arrayBuffer = await fileData.arrayBuffer()
-      const buffer = new Uint8Array(arrayBuffer)
-      const data = await pdfParse(buffer)
-
-      const pageCount: number = data.numpages
-      const fullText: string = data.text || ''
-
-      const pages = splitTextByPageCount(fullText, pageCount, fileName)
-      return { pageCount, pages }
-    } catch (err) {
-      console.warn('pdf-parse failed, falling back to text split:', err)
-    }
-  }
-
-  // Fallback for images or failed PDF parsing: treat the whole file as one page
-  const rawText = await fileData.text().catch(() => `[Nicht lesbar: ${fileName}]`)
-  return { pageCount: 1, pages: [{ page: 1, text: rawText }] }
-}
-
-/** Split a full-document text into individual page objects. */
-function splitTextByPageCount(text: string, pageCount: number, fileName: string): RawPage[] {
-  if (!text?.trim()) {
-    // Scanned PDF — no extractable text, create one placeholder per page
-    return Array.from({ length: pageCount }, (_, i) => ({
-      page: i + 1,
-      text: `[Seite ${i + 1} aus ${fileName} – gescanntes Bild, OCR erforderlich]`,
-    }))
-  }
-
-  // If pdf-parse inserted form-feeds between pages, use those
-  const ffParts = text.split('\f').map(t => t.trim()).filter(t => t.length > 0)
-  if (ffParts.length === pageCount) {
-    return ffParts.map((t, i) => ({ page: i + 1, text: t }))
-  }
-
-  // Otherwise split evenly by line count
-  const lines = text.split('\n')
-  const linesPerPage = Math.max(1, Math.ceil(lines.length / pageCount))
-  return Array.from({ length: pageCount }, (_, i) => ({
-    page: i + 1,
-    text: lines.slice(i * linesPerPage, (i + 1) * linesPerPage).join('\n').trim(),
-  }))
-}
 
 function dotProduct(a: number[], b: number[]): number {
   return a.reduce((sum, v, i) => sum + v * b[i], 0)
@@ -186,41 +236,64 @@ serve(async (req) => {
   try {
     const body = await req.json()
     scanId = body.scanId
-    const { filePath, fileName } = body
+    const pageCount: number = body.pageCount
 
-    if (!scanId || !filePath || !fileName) {
-      throw new Error('Missing required parameters: scanId, filePath, fileName')
+    if (!scanId || !pageCount) {
+      throw new Error('Missing required parameters: scanId, pageCount')
     }
 
-    await supabase.from('raw_scans').update({ status: 'processing', pipeline_results: [] }).eq('id', scanId)
+    await supabase.from('raw_scans')
+      .update({ status: 'processing', pipeline_results: [] })
+      .eq('id', scanId)
 
-    // ── Step 0: Download file ──────────────────────────────────────────────
-    const { data: fileData, error: downloadError } = await supabase.storage
-      .from('raw-scans')
-      .download(filePath)
-    if (downloadError) throw downloadError
+    // ── Step 1: OCR all PNGs via Google Vision API (max 5 parallel) ──────────
+    const token = await getGoogleAccessToken(
+      Deno.env.get('GOOGLE_CLIENT_EMAIL')!,
+      Deno.env.get('GOOGLE_PRIVATE_KEY')!
+    )
 
-    // Use pdf-parse for PDFs to get the correct numpages value
-    const { pageCount, pages: rawPages } = await extractPdfPages(fileData, fileName)
+    const pageFilenames = Array.from({ length: pageCount }, (_, i) =>
+      `page_${String(i + 1).padStart(3, '0')}.png`
+    )
 
-    await supabase.from('raw_scans').update({ page_count: pageCount }).eq('id', scanId)
+    // Read originalFilename from meta.json for use in analyze-page prompts
+    let originalFilename = 'scan.pdf'
+    try {
+      const { data: metaBlob } = await supabase.storage
+        .from('raw-scans')
+        .download(`${scanId}/meta.json`)
+      if (metaBlob) {
+        const meta = JSON.parse(await metaBlob.text())
+        if (meta.originalFilename) originalFilename = meta.originalFilename
+      }
+    } catch { /* non-critical */ }
 
-    // ── Step 1: Analyze each page with Claude Haiku (max 5 parallel) ──────
-    const analyzeTasks = rawPages.map((p: RawPage) => async () => {
+    const ocrTasks = pageFilenames.map((filename) => async () => {
+      try {
+        return await ocrPageWithVision(supabase, scanId!, filename, token)
+      } catch (err) {
+        console.warn(`OCR failed for ${filename}:`, err)
+        return `[Seite nicht lesbar: ${filename}]`
+      }
+    })
+
+    const pageTexts: string[] = await pLimit(ocrTasks, 5)
+
+    // ── Step 2: Analyze each page text with Claude Haiku (max 5 parallel) ────
+    const analyzeTasks = pageTexts.map((text, i) => async () => {
       try {
         return await callFunction('analyze-page', {
-          page: p.page,
-          text: p.text,
-          fileName,
+          page: i + 1,
+          text,
+          fileName: originalFilename,
         }) as AnalyzedPage
       } catch {
-        // Fallback: return a minimal analyzed page without embedding
         return {
-          page: p.page,
-          topic_key: `page_${p.page}`,
-          topic_label: `Seite ${p.page}`,
-          topic_embedding_text: p.text.slice(0, 200),
-          content_html: `<p>${p.text.slice(0, 500)}</p>`,
+          page: i + 1,
+          topic_key: `page_${i + 1}`,
+          topic_label: `Seite ${i + 1}`,
+          topic_embedding_text: text.slice(0, 200),
+          content_html: `<p>${text.slice(0, 500)}</p>`,
           key_concepts: [],
         } as AnalyzedPage
       }
@@ -228,7 +301,7 @@ serve(async (req) => {
 
     const analyzedPages = (await pLimit(analyzeTasks, 5)) as AnalyzedPage[]
 
-    // ── Step 2: Intra-document clustering (threshold 0.82) ────────────────
+    // ── Step 3: Intra-document clustering (threshold 0.82) ───────────────────
     const pageGroups = clusterByEmbedding(analyzedPages, 0.82)
 
     const pipelineResults: PipelineResult[] = pageGroups.map(g => ({
@@ -238,19 +311,17 @@ serve(async (req) => {
 
     await supabase.from('raw_scans').update({ pipeline_results: pipelineResults }).eq('id', scanId)
 
-    // ── Step 3: For each group → find merge candidate → merge or create ───
+    // ── Step 4: For each group → find merge candidate → merge or create ───────
     for (let gi = 0; gi < pageGroups.length; gi++) {
       const group = pageGroups[gi]
 
       try {
-        // Compute group embedding (average of page embeddings)
         const validEmbeddings = group.pages.map(p => p.embedding).filter(Boolean) as number[][]
         const groupEmbedding = validEmbeddings.length > 0 ? averageEmbedding(validEmbeddings) : null
 
         let result: PipelineResult
 
         if (groupEmbedding) {
-          // Phase A+B: find merge candidate
           const mergeDecision = await callFunction('find-merge-candidate', {
             groupEmbedding,
             topicLabel: group.topic_label,
@@ -262,7 +333,6 @@ serve(async (req) => {
             if (mergeDecision.merge_type === 'duplicate') {
               result = { status: 'duplicate', topic_label: group.topic_label, doc_id: mergeDecision.merge_candidate_id }
             } else {
-              // Merge content into existing doc
               const combinedHtml = group.pages.map(p => p.content_html).join('\n')
               await callFunction('merge-into-document', {
                 docId: mergeDecision.merge_candidate_id,
@@ -272,20 +342,18 @@ serve(async (req) => {
               result = { status: 'merged', topic_label: group.topic_label, doc_id: mergeDecision.merge_candidate_id }
             }
           } else {
-            // Create new document
             const created = await callFunction('create-document', {
               pages: group.pages.map(p => ({ page: p.page, content_html: p.content_html, topic_label: p.topic_label })),
               scanId,
-              fileName,
+              fileName: originalFilename,
             }) as { docId: string; title: string }
             result = { status: 'created', topic_label: created.title || group.topic_label, doc_id: created.docId }
           }
         } else {
-          // No embeddings available → always create
           const created = await callFunction('create-document', {
             pages: group.pages.map(p => ({ page: p.page, content_html: p.content_html, topic_label: p.topic_label })),
             scanId,
-            fileName,
+            fileName: originalFilename,
           }) as { docId: string; title: string }
           result = { status: 'created', topic_label: created.title || group.topic_label, doc_id: created.docId }
         }
@@ -296,7 +364,6 @@ serve(async (req) => {
         console.error(`Group ${gi} failed:`, groupErr)
       }
 
-      // Write intermediate progress after each group
       await supabase.from('raw_scans').update({ pipeline_results: [...pipelineResults] }).eq('id', scanId)
     }
 
