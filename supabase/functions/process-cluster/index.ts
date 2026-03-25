@@ -80,7 +80,7 @@ function clusterByEmbedding(pages: AnalyzedPage[], threshold = 0.82): PageGroup[
   return groups
 }
 
-/** Link page_hashes entries (by scan + page numbers) to a processed doc */
+/** Link page_hashes entries (by scan + page numbers) to a processed doc and mark as processed */
 async function linkPageHashes(
   supabase: ReturnType<typeof createClient>,
   scanId: string,
@@ -89,10 +89,25 @@ async function linkPageHashes(
 ): Promise<void> {
   const { error } = await supabase
     .from('page_hashes')
-    .update({ doc_id: docId })
+    .update({ doc_id: docId, status: 'processed' })
     .eq('scan_id', scanId)
     .in('page_number', pageNumbers)
   if (error) console.warn('[process-cluster] page_hashes update failed:', error.message)
+}
+
+/** Mark page_hashes entries as error */
+async function markPageHashesError(
+  supabase: ReturnType<typeof createClient>,
+  scanId: string,
+  pageNumbers: number[],
+  errorMessage: string
+): Promise<void> {
+  const { error } = await supabase
+    .from('page_hashes')
+    .update({ status: 'error', error_message: errorMessage })
+    .eq('scan_id', scanId)
+    .in('page_number', pageNumbers)
+  if (error) console.warn('[process-cluster] page_hashes error update failed:', error.message)
 }
 
 async function callFunction(name: string, body: unknown): Promise<unknown> {
@@ -181,6 +196,7 @@ serve(async (req) => {
           if (mergeDecision.decision === 'merge' && mergeDecision.merge_candidate_id) {
             if (mergeDecision.merge_type === 'duplicate') {
               result = { status: 'duplicate', topic_label: group.topic_label, doc_id: mergeDecision.merge_candidate_id }
+              await linkPageHashes(supabase, scanId!, group.pages.map(p => p.page), mergeDecision.merge_candidate_id)
             } else {
               const combinedHtml = group.pages.map(p => p.content_html).join('\n')
               await callFunction('merge-into-document', {
@@ -217,6 +233,7 @@ serve(async (req) => {
         const msg = (groupErr as Error).message ?? String(groupErr)
         pipelineResults[gi] = { status: 'error', topic_label: group.topic_label, error_message: msg }
         console.error(`[process-cluster] Gruppe ${gi} (${group.topic_label}) FEHLER:`, msg)
+        await markPageHashesError(supabase, scanId!, group.pages.map(p => p.page), msg)
         // Continue with next group — one failure does not abort the pipeline
       }
 

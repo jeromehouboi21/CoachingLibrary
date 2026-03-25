@@ -73,31 +73,40 @@ export function useUpload() {
       let skippedCount = 0
 
       for (const page of pages) {
-        // Check if this page was already processed
+        // Only skip if page was fully processed (status='processed' AND doc_id set)
         const { data: existingHash } = await supabase
           .from('page_hashes')
-          .select('id')
+          .select('id, status, doc_id')
           .eq('hash', page.hash)
           .maybeSingle()
 
-        if (existingHash) {
+        const fullyProcessed = existingHash?.status === 'processed' && existingHash?.doc_id != null
+
+        if (fullyProcessed) {
           skippedCount++
           setUploadProgress({ current: page.pageNumber, total: resolvedPageCount, skipped: skippedCount })
           continue
         }
 
-        // New page → upload
-        const { error: uploadError } = await supabase.storage
-          .from('raw-scans')
-          .upload(`${scanId}/${page.filename}`, page.blob, { contentType: 'image/png' })
-        if (uploadError) throw uploadError
+        // New or failed page → upload (or re-upload if needed)
+        if (!existingHash) {
+          const { error: uploadError } = await supabase.storage
+            .from('raw-scans')
+            .upload(`${scanId}/${page.filename}`, page.blob, { contentType: 'image/png' })
+          if (uploadError) throw uploadError
+        }
 
-        // Store hash so future uploads can detect this page
-        await supabase.from('page_hashes').insert({
+        // Upsert hash record so failed pages get a fresh scan_id/page_number
+        await supabase.from('page_hashes').upsert({
           hash: page.hash,
           scan_id: scanId,
           page_number: page.pageNumber,
-        })
+          status: 'uploaded',
+          ocr_text: null,
+          analysis: null,
+          error_message: null,
+          doc_id: null,
+        }, { onConflict: 'hash' })
 
         newPageFilenames.push(page.filename)
         setUploadProgress({ current: page.pageNumber, total: resolvedPageCount, skipped: skippedCount })

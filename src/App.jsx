@@ -9,6 +9,7 @@ import MethodsScreen from './screens/methods/MethodsScreen'
 import UploadScreen from './screens/upload/UploadScreen'
 import SearchScreen from './screens/search/SearchScreen'
 import LoginScreen from './screens/login/LoginScreen'
+import ProcessingScreen from './screens/processing/ProcessingScreen'
 
 function ProtectedRoute({ children, session }) {
   if (session === undefined) {
@@ -54,6 +55,7 @@ export default function App() {
               <Route path="/methods" element={<MethodsScreen />} />
               <Route path="/search" element={<SearchScreen />} />
               <Route path="/upload" element={<UploadScreen />} />
+              <Route path="/processing" element={<ProcessingScreen />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Layout>

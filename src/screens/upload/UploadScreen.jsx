@@ -374,6 +374,14 @@ export default function UploadScreen() {
                 Zur Bibliothek
               </button>
             </div>
+
+            <button
+              className="btn btn-ghost"
+              style={{ width: '100%', marginTop: 10, fontSize: '0.875rem', color: 'var(--color-ink-3)' }}
+              onClick={() => navigate('/processing')}
+            >
+              📋 Verarbeitungsstatus anzeigen
+            </button>
           </div>
         )}
 
@@ -393,6 +401,13 @@ export default function UploadScreen() {
             </div>
             <button className="btn btn-primary w-full" onClick={handleReset}>
               Erneut versuchen
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ width: '100%', marginTop: 10, fontSize: '0.875rem', color: 'var(--color-ink-3)' }}
+              onClick={() => navigate('/processing')}
+            >
+              📋 Verarbeitungsstatus anzeigen
             </button>
           </div>
         )}

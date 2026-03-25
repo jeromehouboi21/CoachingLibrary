@@ -41,16 +41,13 @@ async function getGoogleAccessToken(clientEmail: string, privateKey: string): Pr
   const der = Uint8Array.from(atob(pem), c => c.charCodeAt(0))
 
   const cryptoKey = await crypto.subtle.importKey(
-    'pkcs8',
-    der,
+    'pkcs8', der,
     { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
+    false, ['sign']
   )
 
   const sig = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    cryptoKey,
+    'RSASSA-PKCS1-v1_5', cryptoKey,
     new TextEncoder().encode(signingInput)
   )
 
@@ -76,14 +73,15 @@ async function getGoogleAccessToken(clientEmail: string, privateKey: string): Pr
 async function ocrPageWithVision(
   supabase: ReturnType<typeof createClient>,
   scanId: string,
-  pageFilename: string,
+  pageNumber: number,
   token: string
 ): Promise<string> {
+  const filename = `page_${String(pageNumber).padStart(3, '0')}.png`
   const { data, error } = await supabase.storage
     .from('raw-scans')
-    .download(`${scanId}/${pageFilename}`)
+    .download(`${scanId}/${filename}`)
 
-  if (error) throw new Error(`Storage download failed for ${pageFilename}: ${error.message}`)
+  if (error) throw new Error(`Storage download failed for ${filename}: ${error.message}`)
 
   const arrayBuffer = await data.arrayBuffer()
   const bytes = new Uint8Array(arrayBuffer)
@@ -111,7 +109,7 @@ async function ocrPageWithVision(
 
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(`Vision API error for ${pageFilename} (${res.status}): ${text}`)
+    throw new Error(`Vision API error (${res.status}): ${text}`)
   }
 
   const visionData = await res.json()
@@ -152,12 +150,6 @@ async function pLimit<T>(tasks: (() => Promise<T>)[], concurrency: number): Prom
   return results
 }
 
-/** Parse page number from filename like "page_003.png" → 3 */
-function pageNumberFromFilename(filename: string): number {
-  const match = filename.match(/page_(\d+)/)
-  return match ? parseInt(match[1], 10) : 0
-}
-
 // ─── Main handler ─────────────────────────────────────────────────────────────
 
 serve(async (req) => {
@@ -168,151 +160,153 @@ serve(async (req) => {
     Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
   )
 
-  let scanId: string | undefined
-
   try {
     const body = await req.json()
-    scanId = body.scanId
-    const pageFilenames: string[] = body.pageFilenames
+    // scanId: reprocess a specific scan; omit to reprocess all failed pages across all scans
+    const scanId: string | undefined = body.scanId
 
-    console.log('[process-ocr] gestartet', { scanId, pages: pageFilenames?.length })
+    console.log('[reprocess-pages] gestartet', { scanId: scanId ?? 'alle' })
 
-    if (!scanId) throw new Error('Missing required parameter: scanId')
-    if (!pageFilenames || pageFilenames.length === 0) throw new Error('pageFilenames fehlt im Request-Body')
+    // ── Find pages to reprocess ───────────────────────────────────────────────
+    let query = supabase
+      .from('page_hashes')
+      .select('id, scan_id, page_number, status')
+      .in('status', ['error', 'uploaded', 'processing', 'ocr_complete'])
+      .is('doc_id', null)
 
-    await supabase.from('raw_scans')
-      .update({ status: 'processing' })
-      .eq('id', scanId)
+    if (scanId) {
+      query = query.eq('scan_id', scanId)
+    }
 
-    // ── Step 1: Google Access Token ──────────────────────────────────────────
+    const { data: pages, error: pagesError } = await query
+    if (pagesError) throw pagesError
+
+    if (!pages || pages.length === 0) {
+      return new Response(
+        JSON.stringify({ success: true, reprocessed: 0 }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      )
+    }
+
+    console.log('[reprocess-pages]', pages.length, 'Seiten zu verarbeiten')
+
+    // ── Google token ──────────────────────────────────────────────────────────
     const clientEmail = Deno.env.get('GOOGLE_CLIENT_EMAIL')
     const privateKey = Deno.env.get('GOOGLE_PRIVATE_KEY')?.replace(/\\n/g, '\n')
     if (!clientEmail) throw new Error('Secret GOOGLE_CLIENT_EMAIL fehlt')
     if (!privateKey) throw new Error('Secret GOOGLE_PRIVATE_KEY fehlt')
 
     const token = await getGoogleAccessToken(clientEmail, privateKey)
-    console.log('[process-ocr] Access Token erhalten')
 
-    // ── Step 2: Read originalFilename from meta.json ─────────────────────────
-    let originalFilename = 'scan.pdf'
-    try {
-      const { data: metaBlob } = await supabase.storage
-        .from('raw-scans')
-        .download(`${scanId}/meta.json`)
-      if (metaBlob) {
-        const meta = JSON.parse(await metaBlob.text())
-        if (meta.originalFilename) originalFilename = meta.originalFilename
-      }
-    } catch { /* non-critical */ }
+    // Group pages by scan_id to get originalFilename once per scan
+    const scanIds = [...new Set(pages.map(p => p.scan_id))]
+    const scanFilenames: Record<string, string> = {}
 
-    console.log('[process-ocr] OCR startet für', pageFilenames.length, 'Seiten…')
+    for (const sid of scanIds) {
+      try {
+        const { data: metaBlob } = await supabase.storage
+          .from('raw-scans')
+          .download(`${sid}/meta.json`)
+        if (metaBlob) {
+          const meta = JSON.parse(await metaBlob.text())
+          scanFilenames[sid] = meta.originalFilename || 'scan.pdf'
+        }
+      } catch { scanFilenames[sid] = 'scan.pdf' }
+    }
 
-    // ── Step 3: OCR each page, write per-page status to page_hashes ──────────
-    const ocrTasks = pageFilenames.map((filename) => async () => {
-      const pageNumber = pageNumberFromFilename(filename)
+    // ── Reprocess each page: OCR + analyze ───────────────────────────────────
+    const tasks = pages.map((page) => async () => {
+      const { scan_id, page_number } = page
 
-      // Mark page as processing
       await supabase.from('page_hashes')
-        .update({ status: 'processing' })
-        .eq('scan_id', scanId!)
-        .eq('page_number', pageNumber)
+        .update({ status: 'processing', error_message: null })
+        .eq('id', page.id)
 
       try {
-        const text = await ocrPageWithVision(supabase, scanId!, filename, token)
-        console.log(`[process-ocr] OCR OK: ${filename} → ${text.length} Zeichen`)
+        // OCR
+        const ocrText = await ocrPageWithVision(supabase, scan_id, page_number, token)
 
-        // Save OCR text and mark ocr_complete
         await supabase.from('page_hashes')
-          .update({ status: 'ocr_complete', ocr_text: text })
-          .eq('scan_id', scanId!)
-          .eq('page_number', pageNumber)
+          .update({ status: 'ocr_complete', ocr_text: ocrText })
+          .eq('id', page.id)
 
-        return text
+        // Analyze
+        const analyzed = await callFunction('analyze-page', {
+          page: page_number,
+          text: ocrText,
+          fileName: scanFilenames[scan_id] || 'scan.pdf',
+        }) as AnalyzedPage
+
+        await supabase.from('page_hashes')
+          .update({ analysis: analyzed })
+          .eq('id', page.id)
+
+        console.log(`[reprocess-pages] OK: scan=${scan_id} page=${page_number}`)
+        return { success: true, id: page.id }
       } catch (err) {
         const msg = (err as Error).message
-        console.error(`[process-ocr] OCR FEHLER: ${filename}:`, msg)
+        console.error(`[reprocess-pages] FEHLER scan=${scan_id} page=${page_number}:`, msg)
 
         await supabase.from('page_hashes')
           .update({ status: 'error', error_message: msg })
-          .eq('scan_id', scanId!)
-          .eq('page_number', pageNumber)
+          .eq('id', page.id)
 
-        return `[Seite nicht lesbar: ${filename}]`
+        return { success: false, id: page.id, error: msg }
       }
     })
 
-    const pageTexts: string[] = await pLimit(ocrTasks, 5)
+    const results = await pLimit(tasks, 5)
 
-    // ── Step 4: Analyze each page with Claude Haiku (max 5 parallel) ─────────
-    console.log('[process-ocr] Haiku-Analyse startet…')
+    // ── Trigger clustering for each affected scan ─────────────────────────────
+    const processedScanIds = [...new Set(
+      results
+        .filter(r => r.success)
+        .map(r => pages.find(p => p.id === r.id)?.scan_id)
+        .filter(Boolean)
+    )] as string[]
 
-    const analyzeTasks = pageTexts.map((text, i) => async () => {
-      const filename = pageFilenames[i]
-      const pageNumber = pageNumberFromFilename(filename)
-
+    const clusterResults: Record<string, unknown> = {}
+    for (const sid of processedScanIds) {
       try {
-        const result = await callFunction('analyze-page', {
-          page: i + 1,
-          text,
-          fileName: originalFilename,
-        }) as AnalyzedPage
-        console.log(`[process-ocr] analyze-page OK: Seite ${i + 1} → ${result.topic_label}`)
+        // Build ocr_results from page_hashes analysis for this scan
+        const { data: analyzedRows } = await supabase
+          .from('page_hashes')
+          .select('page_number, analysis')
+          .eq('scan_id', sid)
+          .not('analysis', 'is', null)
+          .order('page_number')
 
-        // Save analysis JSONB to page_hashes
-        await supabase.from('page_hashes')
-          .update({ analysis: result })
-          .eq('scan_id', scanId!)
-          .eq('page_number', pageNumber)
+        if (!analyzedRows || analyzedRows.length === 0) continue
 
-        return result
+        const ocrResults = analyzedRows.map(r => ({ ...r.analysis, page: r.page_number }))
+
+        await supabase.from('raw_scans')
+          .update({ status: 'ocr_complete', ocr_results: ocrResults })
+          .eq('id', sid)
+
+        const clusterResult = await callFunction('process-cluster', { scanId: sid })
+        clusterResults[sid] = clusterResult
+        console.log(`[reprocess-pages] Clustering OK für scan=${sid}`)
       } catch (err) {
-        const msg = (err as Error).message
-        console.error(`[process-ocr] analyze-page FEHLER Seite ${i + 1}:`, msg)
-
-        const fallback: AnalyzedPage = {
-          page: i + 1,
-          topic_key: `page_${i + 1}`,
-          topic_label: `Seite ${i + 1}`,
-          topic_embedding_text: text.slice(0, 200),
-          content_html: `<p>${text.slice(0, 500)}</p>`,
-          key_concepts: [],
-        }
-
-        await supabase.from('page_hashes')
-          .update({ analysis: fallback, error_message: msg })
-          .eq('scan_id', scanId!)
-          .eq('page_number', pageNumber)
-
-        return fallback
+        console.error(`[reprocess-pages] Clustering FEHLER scan=${sid}:`, (err as Error).message)
+        clusterResults[sid] = { error: (err as Error).message }
       }
-    })
+    }
 
-    const analyzedPages = (await pLimit(analyzeTasks, 5)) as AnalyzedPage[]
-
-    console.log('[process-ocr] abgeschlossen:', analyzedPages.length, 'Seiten analysiert')
-
-    // ── Step 5: Save results to DB for process-cluster to pick up ─────────────
-    const { error: saveError } = await supabase.from('raw_scans').update({
-      status: 'ocr_complete',
-      ocr_results: analyzedPages,
-    }).eq('id', scanId)
-
-    if (saveError) throw saveError
+    const successCount = results.filter(r => r.success).length
+    const errorCount = results.filter(r => !r.success).length
 
     return new Response(
-      JSON.stringify({ success: true, pageCount: analyzedPages.length }),
+      JSON.stringify({
+        success: true,
+        reprocessed: successCount,
+        errors: errorCount,
+        clusteredScans: processedScanIds.length,
+      }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
   } catch (error) {
-    console.error('[process-ocr] FEHLER:', (error as Error).message)
-
-    if (scanId) {
-      const { error: updateError } = await supabase.from('raw_scans').update({
-        status: 'error',
-        error_message: (error as Error).message,
-      }).eq('id', scanId)
-      if (updateError) console.error('[process-ocr] Status-Update fehlgeschlagen:', updateError.message)
-    }
+    console.error('[reprocess-pages] FEHLER:', (error as Error).message)
 
     return new Response(
       JSON.stringify({ error: (error as Error).message }),
