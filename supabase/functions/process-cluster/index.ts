@@ -80,6 +80,21 @@ function clusterByEmbedding(pages: AnalyzedPage[], threshold = 0.82): PageGroup[
   return groups
 }
 
+/** Link page_hashes entries (by scan + page numbers) to a processed doc */
+async function linkPageHashes(
+  supabase: ReturnType<typeof createClient>,
+  scanId: string,
+  pageNumbers: number[],
+  docId: string
+): Promise<void> {
+  const { error } = await supabase
+    .from('page_hashes')
+    .update({ doc_id: docId })
+    .eq('scan_id', scanId)
+    .in('page_number', pageNumbers)
+  if (error) console.warn('[process-cluster] page_hashes update failed:', error.message)
+}
+
 async function callFunction(name: string, body: unknown): Promise<unknown> {
   const url = `${Deno.env.get('SUPABASE_URL')}/functions/v1/${name}`
   const res = await fetch(url, {
@@ -174,6 +189,7 @@ serve(async (req) => {
                 mergeType: mergeDecision.merge_type || 'append',
               })
               result = { status: 'merged', topic_label: group.topic_label, doc_id: mergeDecision.merge_candidate_id }
+              await linkPageHashes(supabase, scanId!, group.pages.map(p => p.page), mergeDecision.merge_candidate_id)
             }
           } else {
             const created = await callFunction('create-document', {
@@ -182,6 +198,7 @@ serve(async (req) => {
               fileName: originalFilename,
             }) as { docId: string; title: string }
             result = { status: 'created', topic_label: created.title || group.topic_label, doc_id: created.docId }
+            await linkPageHashes(supabase, scanId!, group.pages.map(p => p.page), created.docId)
           }
         } else {
           // No embedding available → always create
@@ -191,6 +208,7 @@ serve(async (req) => {
             fileName: originalFilename,
           }) as { docId: string; title: string }
           result = { status: 'created', topic_label: created.title || group.topic_label, doc_id: created.docId }
+          await linkPageHashes(supabase, scanId!, group.pages.map(p => p.page), created.docId)
         }
 
         pipelineResults[gi] = result

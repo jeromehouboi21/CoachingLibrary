@@ -167,11 +167,16 @@ serve(async (req) => {
   try {
     const body = await req.json()
     scanId = body.scanId
-    const pageCount: number = body.pageCount
+    // Accept explicit filename list (when some pages were skipped due to duplicate detection)
+    // or fall back to generating filenames from pageCount for backward compatibility
+    const pageFilenames: string[] = body.pageFilenames
+      ?? Array.from({ length: body.pageCount as number }, (_, i) =>
+        `page_${String(i + 1).padStart(3, '0')}.png`
+      )
 
-    console.log('[process-ocr] gestartet', { scanId, pageCount })
+    console.log('[process-ocr] gestartet', { scanId, pages: pageFilenames.length })
 
-    if (!scanId || !pageCount) throw new Error('Missing required parameters: scanId, pageCount')
+    if (!scanId || pageFilenames.length === 0) throw new Error('Missing required parameters: scanId, pageFilenames')
 
     await supabase.from('raw_scans')
       .update({ status: 'processing' })
@@ -197,11 +202,6 @@ serve(async (req) => {
         if (meta.originalFilename) originalFilename = meta.originalFilename
       }
     } catch { /* non-critical */ }
-
-    // ── Step 3: OCR all PNGs via Vision API (max 5 parallel) ─────────────────
-    const pageFilenames = Array.from({ length: pageCount }, (_, i) =>
-      `page_${String(i + 1).padStart(3, '0')}.png`
-    )
 
     console.log('[process-ocr] OCR startet für', pageCount, 'Seiten…')
 

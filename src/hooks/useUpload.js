@@ -2,17 +2,12 @@ import { useState, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 import { convertPdfToPages } from '../lib/pdfToPages'
 
-/**
- * Pipeline result from raw_scans.pipeline_results JSONB:
- * { status: 'created' | 'merged' | 'duplicate' | 'error' | 'processing', topic_label, doc_id?, error_message? }
- */
-
 export function useUpload() {
   // idle | converting | uploading | analyzing | clustering | done | error
   const [status, setStatus] = useState('idle')
   const [pipelineResults, setPipelineResults] = useState([])
   const [convertProgress, setConvertProgress] = useState({ current: 0, total: 0 })
-  const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 })
+  const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0, skipped: 0 })
   const [pageCount, setPageCount] = useState(0)
   const [error, setError] = useState(null)
   const pollRef = useRef(null)
@@ -21,15 +16,14 @@ export function useUpload() {
     setStatus('converting')
     setPipelineResults([])
     setConvertProgress({ current: 0, total: 0 })
-    setUploadProgress({ current: 0, total: 0 })
+    setUploadProgress({ current: 0, total: 0, skipped: 0 })
     setPageCount(0)
     setError(null)
 
     try {
-      const { data: { user } } = await supabase.auth.getUser()
       const scanId = crypto.randomUUID()
 
-      // ── Phase 1: PDF → PNGs (client-side, PDF.js) ──────────────────────────
+      // ── Phase 1: PDF → PNGs with SHA-256 hashes (client-side, PDF.js) ───────
       const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
 
       let pages, resolvedPageCount
@@ -41,17 +35,22 @@ export function useUpload() {
         pages = result.pages
         resolvedPageCount = result.pageCount
       } else {
-        pages = [{ pageNumber: 1, blob: file, filename: 'page_001.png' }]
+        // Single image: compute hash manually
+        const arrayBuffer = await file.arrayBuffer()
+        const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer)
+        const hash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('')
+        pages = [{ pageNumber: 1, blob: file, filename: 'page_001.png', hash }]
         resolvedPageCount = 1
         setConvertProgress({ current: 1, total: 1 })
       }
 
       setPageCount(resolvedPageCount)
 
-      // ── Phase 2: Upload PNGs + meta.json to Storage ─────────────────────────
+      // ── Phase 2: Hash-check + conditional upload ──────────────────────────
       setStatus('uploading')
-      setUploadProgress({ current: 0, total: resolvedPageCount })
+      setUploadProgress({ current: 0, total: resolvedPageCount, skipped: 0 })
 
+      // Create raw_scans record
       const { error: dbError } = await supabase.from('raw_scans').insert({
         id: scanId,
         filename: file.name,
@@ -61,6 +60,7 @@ export function useUpload() {
       })
       if (dbError) throw dbError
 
+      // Upload meta.json
       await supabase.storage.from('raw-scans').upload(
         `${scanId}/meta.json`,
         new Blob(
@@ -69,26 +69,59 @@ export function useUpload() {
         )
       )
 
+      const newPageFilenames = []
+      let skippedCount = 0
+
       for (const page of pages) {
+        // Check if this page was already processed
+        const { data: existingHash } = await supabase
+          .from('page_hashes')
+          .select('id')
+          .eq('hash', page.hash)
+          .maybeSingle()
+
+        if (existingHash) {
+          skippedCount++
+          setUploadProgress({ current: page.pageNumber, total: resolvedPageCount, skipped: skippedCount })
+          continue
+        }
+
+        // New page → upload
         const { error: uploadError } = await supabase.storage
           .from('raw-scans')
           .upload(`${scanId}/${page.filename}`, page.blob, { contentType: 'image/png' })
         if (uploadError) throw uploadError
-        setUploadProgress(prev => ({ ...prev, current: page.pageNumber }))
+
+        // Store hash so future uploads can detect this page
+        await supabase.from('page_hashes').insert({
+          hash: page.hash,
+          scan_id: scanId,
+          page_number: page.pageNumber,
+        })
+
+        newPageFilenames.push(page.filename)
+        setUploadProgress({ current: page.pageNumber, total: resolvedPageCount, skipped: skippedCount })
+      }
+
+      // All pages already known → done without API calls
+      if (newPageFilenames.length === 0) {
+        await supabase.from('raw_scans').update({ status: 'processed', pipeline_results: [] }).eq('id', scanId)
+        setStatus('done')
+        return
       }
 
       // ── Phase 3: OCR + Haiku analysis (Edge Function: process-ocr) ──────────
       setStatus('analyzing')
 
       const { error: ocrError } = await supabase.functions.invoke('process-ocr', {
-        body: { scanId, pageCount: resolvedPageCount },
+        body: { scanId, pageFilenames: newPageFilenames },
       })
       if (ocrError) throw new Error(`OCR fehlgeschlagen: ${ocrError.message}`)
 
       // ── Phase 4: Clustering + DB integration (Edge Function: process-cluster) ─
       setStatus('clustering')
 
-      // Start polling for live group results during clustering
+      // Poll for live group results during clustering
       pollRef.current = setInterval(async () => {
         const { data } = await supabase
           .from('raw_scans')
@@ -107,7 +140,7 @@ export function useUpload() {
 
       if (clusterError) throw new Error(`Clustering fehlgeschlagen: ${clusterError.message}`)
 
-      // Final read to get complete results
+      // Final read for complete results
       const { data: finalScan } = await supabase
         .from('raw_scans')
         .select('pipeline_results')
@@ -131,7 +164,7 @@ export function useUpload() {
     setStatus('idle')
     setPipelineResults([])
     setConvertProgress({ current: 0, total: 0 })
-    setUploadProgress({ current: 0, total: 0 })
+    setUploadProgress({ current: 0, total: 0, skipped: 0 })
     setPageCount(0)
     setError(null)
   }

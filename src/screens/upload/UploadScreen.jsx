@@ -87,6 +87,7 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
               ? `${uploadProgress.current}/${uploadProgress.total}`
               : uploadDone ? '✓' : '…'}
             done={uploadDone}
+            note={uploadProgress.skipped > 0 ? `${uploadProgress.skipped} bereits bekannt` : null}
           />
           <ProgressRow
             label="Phase 3 · OCR & KI-Analyse"
@@ -141,16 +142,19 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
   )
 }
 
-function ProgressRow({ label, value, done }) {
+function ProgressRow({ label, value, done, note }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ fontSize: '0.875rem', color: done ? 'var(--color-accent)' : 'var(--color-ink-3)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+        <span style={{ fontSize: '0.875rem', color: done ? 'var(--color-accent)' : 'var(--color-ink-3)', flexShrink: 0 }}>
           {done ? '✓' : <span className="spinner" style={{ width: 12, height: 12, display: 'inline-block' }} />}
         </span>
         <span style={{ fontSize: '0.875rem', color: 'var(--color-ink-2)' }}>{label}</span>
+        {note && (
+          <span style={{ fontSize: '0.75rem', color: 'var(--color-ink-3)', marginLeft: 4 }}>· {note}</span>
+        )}
       </div>
-      <span style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--color-ink)' }}>{value}</span>
+      <span style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--color-ink)', flexShrink: 0 }}>{value}</span>
     </div>
   )
 }
@@ -296,21 +300,38 @@ export default function UploadScreen() {
               background: 'var(--color-surface)', borderRadius: 'var(--radius-lg)',
               boxShadow: 'var(--shadow-sm)', marginBottom: 20,
             }}>
-              <div style={{ fontSize: '3rem', marginBottom: 8 }}>✅</div>
-              <h2 style={{ fontFamily: 'DM Serif Display, Georgia, serif', fontSize: '1.375rem', marginBottom: 8 }}>
-                Verarbeitung abgeschlossen!
-              </h2>
-              <div style={{ display: 'flex', justifyContent: 'center', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
-                {stats.created > 0 && (
-                  <StatPill icon="✅" value={stats.created} label="neu erstellt" />
-                )}
-                {stats.merged > 0 && (
-                  <StatPill icon="🔀" value={stats.merged} label="gemergt" />
-                )}
-                {stats.duplicate > 0 && (
-                  <StatPill icon="⭐" value={stats.duplicate} label="Duplikat" />
-                )}
-              </div>
+              {uploadProgress.skipped > 0 && uploadProgress.skipped === uploadProgress.total ? (
+                <>
+                  <div style={{ fontSize: '3rem', marginBottom: 8 }}>⭐</div>
+                  <h2 style={{ fontFamily: 'DM Serif Display, Georgia, serif', fontSize: '1.375rem', marginBottom: 8 }}>
+                    Alle Seiten bereits bekannt
+                  </h2>
+                  <p style={{ color: 'var(--color-ink-2)', fontSize: '0.9375rem' }}>
+                    Alle {uploadProgress.total} Seiten dieser Datei sind bereits in der Bibliothek enthalten.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: '3rem', marginBottom: 8 }}>✅</div>
+                  <h2 style={{ fontFamily: 'DM Serif Display, Georgia, serif', fontSize: '1.375rem', marginBottom: 8 }}>
+                    Verarbeitung abgeschlossen!
+                  </h2>
+                  <div style={{ display: 'flex', justifyContent: 'center', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
+                    {stats.created > 0 && (
+                      <StatPill icon="✅" value={stats.created} label="neu erstellt" />
+                    )}
+                    {stats.merged > 0 && (
+                      <StatPill icon="🔀" value={stats.merged} label="gemergt" />
+                    )}
+                    {stats.duplicate > 0 && (
+                      <StatPill icon="⭐" value={stats.duplicate} label="Duplikat" />
+                    )}
+                    {uploadProgress.skipped > 0 && (
+                      <StatPill icon="⏭️" value={uploadProgress.skipped} label="übersprungen" />
+                    )}
+                  </div>
+                </>
+              )}
             </div>
 
             {/* Detailed results */}

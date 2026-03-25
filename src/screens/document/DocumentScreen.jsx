@@ -86,8 +86,29 @@ export default function DocumentScreen() {
   const [error, setError] = useState(null)
   const [showNoteModal, setShowNoteModal] = useState(false)
   const [notesKey, setNotesKey] = useState(0)
+  const [showMenu, setShowMenu] = useState(false)
+  const [deleteError, setDeleteError] = useState(null)
 
   const { notes, deleteNote, loading: notesLoading } = useNotes(id)
+
+  async function handleDeleteDocument() {
+    const confirmed = window.confirm(
+      `"${doc?.title}" dauerhaft löschen?\n\nAlle Notizen zu diesem Artikel werden ebenfalls entfernt.`
+    )
+    if (!confirmed) return
+
+    const { error: delError } = await supabase
+      .from('knowledge_docs')
+      .delete()
+      .eq('id', id)
+
+    if (delError) {
+      setDeleteError(delError.message)
+      return
+    }
+
+    navigate('/')
+  }
 
   useEffect(() => {
     async function fetchDoc() {
@@ -152,13 +173,53 @@ export default function DocumentScreen() {
   return (
     <div className="screen">
       <div className="screen-header">
-        <button className="back-btn" onClick={() => navigate(-1)}>← Zurück</button>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <button className="back-btn" onClick={() => navigate(-1)}>← Zurück</button>
+          <div style={{ position: 'relative' }}>
+            <button
+              className="btn btn-ghost btn-icon"
+              style={{ fontSize: '1.25rem' }}
+              onClick={() => setShowMenu(m => !m)}
+              aria-label="Menü"
+            >
+              ···
+            </button>
+            {showMenu && (
+              <>
+                <div
+                  style={{ position: 'fixed', inset: 0, zIndex: 10 }}
+                  onClick={() => setShowMenu(false)}
+                />
+                <div style={{
+                  position: 'absolute', right: 0, top: '100%', zIndex: 20,
+                  background: 'var(--color-surface)', borderRadius: 'var(--radius-md)',
+                  boxShadow: 'var(--shadow-lg)', minWidth: 180, overflow: 'hidden',
+                }}>
+                  <button
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+                      padding: '12px 16px', background: 'none', border: 'none',
+                      cursor: 'pointer', fontSize: '0.9375rem', color: '#c0392b',
+                      textAlign: 'left',
+                    }}
+                    onClick={() => { setShowMenu(false); handleDeleteDocument() }}
+                  >
+                    🗑️ Artikel löschen
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
         {doc.category && doc.subcategory && (
           <div className="breadcrumb" style={{ marginTop: 4 }}>
             <span>{doc.category}</span>
             <span className="breadcrumb__sep">›</span>
             <span style={{ color: 'var(--color-ink-2)' }}>{doc.subcategory}</span>
           </div>
+        )}
+        {deleteError && (
+          <div className="alert alert-error" style={{ marginTop: 8 }}>{deleteError}</div>
         )}
       </div>
 

@@ -42,11 +42,45 @@ function SkeletonCard() {
   )
 }
 
-function DocCard({ doc, onClick }) {
+function DocCard({ doc, onClick, onDelete }) {
+  const [hovered, setHovered] = useState(false)
+
+  function handleDelete(e) {
+    e.stopPropagation()
+    const confirmed = window.confirm(
+      `"${doc.title}" dauerhaft löschen?\n\nAlle Notizen werden ebenfalls entfernt.`
+    )
+    if (confirmed) onDelete(doc.id, doc.title)
+  }
+
   return (
-    <div className="card card--interactive" onClick={onClick} role="button" tabIndex={0}
-      onKeyDown={e => { if (e.key === 'Enter') onClick() }}>
-      <div className="card-title">{doc.title}</div>
+    <div
+      className="card card--interactive"
+      onClick={onClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={e => { if (e.key === 'Enter') onClick() }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{ position: 'relative' }}
+    >
+      {(hovered) && (
+        <button
+          onClick={handleDelete}
+          title="Löschen"
+          style={{
+            position: 'absolute', top: 8, right: 8,
+            background: 'rgba(192,57,43,0.1)', border: 'none',
+            borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+            width: 28, height: 28, display: 'flex', alignItems: 'center',
+            justifyContent: 'center', fontSize: '0.875rem', color: '#c0392b',
+            zIndex: 1,
+          }}
+        >
+          🗑️
+        </button>
+      )}
+      <div className="card-title" style={{ paddingRight: 32 }}>{doc.title}</div>
       {doc.summary && (
         <div className="card-summary">{doc.summary}</div>
       )}
@@ -77,6 +111,22 @@ export default function LibraryScreen() {
   const [searchInput, setSearchInput] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [totalCount, setTotalCount] = useState(null)
+  const [deletedIds, setDeletedIds] = useState(new Set())
+
+  async function handleDeleteDocument(docId) {
+    const { error } = await supabase
+      .from('knowledge_docs')
+      .delete()
+      .eq('id', docId)
+
+    if (error) {
+      console.error('Löschen fehlgeschlagen:', error.message)
+      return
+    }
+
+    setDeletedIds(prev => new Set([...prev, docId]))
+    setTotalCount(c => (c !== null ? c - 1 : c))
+  }
 
   // Debounce search
   useEffect(() => {
@@ -181,11 +231,12 @@ export default function LibraryScreen() {
           </div>
         ) : (
           <div className="card-grid">
-            {docs.map(doc => (
+            {docs.filter(doc => !deletedIds.has(doc.id)).map(doc => (
               <DocCard
                 key={doc.id}
                 doc={doc}
                 onClick={() => navigate(`/doc/${doc.id}`)}
+                onDelete={handleDeleteDocument}
               />
             ))}
           </div>
