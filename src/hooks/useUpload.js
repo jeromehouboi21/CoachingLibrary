@@ -122,8 +122,13 @@ export function useUpload() {
       // ── Phase 3: OCR + Haiku analysis (Edge Function: process-ocr) ──────────
       setStatus('analyzing')
 
+      // Fetch session once for both invocations — prevents 401 after long uploads
+      const { data: { session } } = await supabase.auth.getSession()
+      const authHeader = { Authorization: `Bearer ${session?.access_token}` }
+
       const { error: ocrError } = await supabase.functions.invoke('process-ocr', {
         body: { scanId, pageFilenames: newPageFilenames },
+        headers: authHeader,
       })
       if (ocrError) throw new Error(`OCR fehlgeschlagen: ${ocrError.message}`)
 
@@ -142,6 +147,7 @@ export function useUpload() {
 
       const { error: clusterError } = await supabase.functions.invoke('process-cluster', {
         body: { scanId },
+        headers: authHeader,
       })
 
       clearInterval(pollRef.current)

@@ -40,8 +40,15 @@ export function useProcessing() {
   }, [])
 
   async function _reprocessAndCluster(body) {
+    // Fetch session once for all invocations
+    const { data: { session } } = await supabase.auth.getSession()
+    const authHeader = { Authorization: `Bearer ${session?.access_token}` }
+
     // Step 1: OCR + analyze failed pages
-    const { data, error: err } = await supabase.functions.invoke('reprocess-pages', { body })
+    const { data, error: err } = await supabase.functions.invoke('reprocess-pages', {
+      body,
+      headers: authHeader,
+    })
     if (err) throw new Error(err.message)
 
     // Step 2: Trigger clustering for each affected scan (with user JWT — avoids 401)
@@ -49,6 +56,7 @@ export function useProcessing() {
     for (const scanId of scanIds) {
       const { error: clusterErr } = await supabase.functions.invoke('process-cluster', {
         body: { scanId },
+        headers: authHeader,
       })
       if (clusterErr) {
         console.error(`process-cluster fehlgeschlagen für ${scanId}:`, clusterErr.message)
