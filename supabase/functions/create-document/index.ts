@@ -34,7 +34,13 @@ serve(async (req) => {
       system: `Du erstellst ein Wissensdokument für eine persönliche Coaching-Wissensbibliothek.
 Der Inhalt stammt aus Seminarunterlagen einer Systemisches-Coaching-Ausbildung.
 Fasse NICHTS zusammen oder kürze NICHTS – integriere den vollständigen Inhalt aller Abschnitte in ein kohärentes, gut strukturiertes Dokument.
-Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.`,
+Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.
+
+WICHTIG für die JSON-Ausgabe:
+- Verwende in content_html ausschließlich einfache Anführungszeichen für HTML-Attribute: <p class='x'> statt <p class="x">
+- Alle doppelten Anführungszeichen innerhalb von Texten müssen als \\" escaped werden
+- Zeilenumbrüche im content_html als \\n schreiben, nicht als echte Zeilenumbrüche
+- Die gesamte Antwort muss valides JSON sein das JSON.parse() besteht`,
       messages: [{
         role: 'user',
         content: `${sectionsText}
@@ -56,7 +62,7 @@ JSON-Format:
     const match = rawText.match(/\{[\s\S]*\}/)
     if (!match) throw new Error('No JSON in Sonnet response')
 
-    const doc = JSON.parse(match[0])
+    const doc = parseClaudeJson(match[0])
     const contentText = doc.content_html?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || ''
 
     // Generate summary embedding
@@ -138,6 +144,46 @@ JSON-Format:
     )
   }
 })
+
+function parseClaudeJson(raw: string): Record<string, unknown> {
+  // 1. Remove accidental markdown fences
+  const cleaned = raw
+    .replace(/^```json\s*/m, '')
+    .replace(/^```\s*/m, '')
+    .replace(/```\s*$/m, '')
+    .trim()
+
+  // 2. Direct parse attempt
+  try {
+    return JSON.parse(cleaned)
+  } catch (firstError) {
+    // 3. Fallback: escape unescaped double-quotes inside content_html value
+    try {
+      const fixed = cleaned.replace(
+        /("content_html"\s*:\s*")([\s\S]*?)("(?:\s*[,}]))/,
+        (_match, prefix, html, suffix) => {
+          // Escape any unescaped double-quotes inside the HTML string
+          const safeHtml = html.replace(/(?<!\\)"/g, '\\"')
+          return `${prefix}${safeHtml}${suffix}`
+        }
+      )
+      return JSON.parse(fixed)
+    } catch (secondError) {
+      // 4. Last resort: return a placeholder document so the group is not lost
+      console.error('[create-document] JSON parse failed:', (firstError as Error).message)
+      console.error('[create-document] Raw response (first 500 chars):', raw.slice(0, 500))
+      return {
+        title: 'Dokument konnte nicht verarbeitet werden',
+        summary: 'JSON-Parsing fehlgeschlagen. Bitte den Scan erneut hochladen.',
+        category: 'Grundlagen',
+        subcategory: 'Unbekannt',
+        tags: ['fehler', 'reprocessing-needed'],
+        difficulty: 'Grundlagen',
+        content_html: '<p>Inhalt konnte nicht extrahiert werden.</p>',
+      }
+    }
+  }
+}
 
 function splitIntoChunks(text: string, chunkSize: number): string[] {
   const words = text.split(/\s+/).filter(w => w.length > 0)

@@ -50,8 +50,16 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
   const groupsDone = stats.done
 
   const convertDone = status !== 'converting'
-  const uploadDone = status !== 'converting' && status !== 'uploading'
-  const processingDone = status === 'done'
+  const uploadDone = !['converting', 'uploading'].includes(status)
+  const analyzingDone = !['converting', 'uploading', 'analyzing'].includes(status)
+  const clusteringDone = status === 'done'
+
+  const PHASE_LABEL = {
+    converting: 'PDF wird konvertiert…',
+    uploading: 'Seiten werden hochgeladen…',
+    analyzing: 'OCR & KI-Analyse läuft…',
+    clustering: 'Wissensdokumente werden erstellt…',
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -61,9 +69,7 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
         padding: '16px', boxShadow: 'var(--shadow-sm)',
       }}>
         <div style={{ fontWeight: 600, fontSize: '0.9375rem', marginBottom: 12, color: 'var(--color-ink)' }}>
-          {status === 'converting' && 'PDF wird konvertiert…'}
-          {status === 'uploading' && 'Seiten werden hochgeladen…'}
-          {status === 'processing' && 'KI-Verarbeitung läuft'}
+          {PHASE_LABEL[status] || 'Verarbeitung läuft'}
           {pageCount > 0 && <span style={{ fontWeight: 400, color: 'var(--color-ink-3)', marginLeft: 6 }}>· {pageCount} Seiten</span>}
         </div>
 
@@ -83,19 +89,14 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
             done={uploadDone}
           />
           <ProgressRow
-            label="Phase 3 · Seiten analysiert (OCR + KI)"
-            value={uploadDone && pageCount > 0 ? `${pageCount}/${pageCount}` : '…'}
-            done={uploadDone && pageCount > 0 && groupsTotal > 0}
+            label="Phase 3 · OCR & KI-Analyse"
+            value={analyzingDone ? (pageCount > 0 ? `${pageCount}/${pageCount}` : '✓') : '…'}
+            done={analyzingDone}
           />
           <ProgressRow
-            label="Cluster erkannt"
-            value={groupsTotal > 0 ? `${groupsTotal} Gruppe${groupsTotal !== 1 ? 'n' : ''}` : '…'}
-            done={groupsTotal > 0}
-          />
-          <ProgressRow
-            label="DB-Integration"
-            value={groupsTotal > 0 ? `${groupsDone}/${groupsTotal}` : '…'}
-            done={groupsDone > 0 && groupsDone === groupsTotal}
+            label="Phase 4 · Wissensdokumente erstellen"
+            value={groupsTotal > 0 ? `${groupsDone}/${groupsTotal}` : clusteringDone ? '✓' : '…'}
+            done={clusteringDone}
           />
         </div>
       </div>
@@ -123,8 +124,8 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
                   <div style={{ fontSize: '0.875rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {r.topic_label}
                   </div>
-                  <div style={{ fontSize: '0.75rem', color: 'var(--color-ink-3)' }}>
-                    {STATUS_LABEL[r.status] || r.status}
+                  <div style={{ fontSize: '0.75rem', color: r.status === 'error' ? '#c0392b' : 'var(--color-ink-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {r.status === 'error' && r.error_message ? r.error_message : (STATUS_LABEL[r.status] || r.status)}
                   </div>
                 </div>
               </div>
@@ -203,7 +204,7 @@ export default function UploadScreen() {
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  const isProcessing = status === 'converting' || status === 'uploading' || status === 'processing'
+  const isProcessing = ['converting', 'uploading', 'analyzing', 'clustering'].includes(status)
 
   return (
     <div className="screen">

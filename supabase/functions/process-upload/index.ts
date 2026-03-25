@@ -27,6 +27,7 @@ interface PipelineResult {
   status: 'created' | 'merged' | 'duplicate' | 'error' | 'processing'
   topic_label: string
   doc_id?: string
+  error_message?: string
 }
 
 // ─── Google Vision API ────────────────────────────────────────────────────────
@@ -380,8 +381,9 @@ serve(async (req) => {
 
         pipelineResults[gi] = result
       } catch (groupErr) {
-        pipelineResults[gi] = { status: 'error', topic_label: group.topic_label }
-        console.error(`Group ${gi} failed:`, groupErr)
+        const msg = (groupErr as Error).message ?? String(groupErr)
+        pipelineResults[gi] = { status: 'error', topic_label: group.topic_label, error_message: msg }
+        console.error(`[process-upload] Gruppe ${gi} (${group.topic_label}) FEHLER:`, msg)
       }
 
       await supabase.from('raw_scans').update({ pipeline_results: [...pipelineResults] }).eq('id', scanId)

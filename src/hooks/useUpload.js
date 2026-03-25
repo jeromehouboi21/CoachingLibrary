@@ -4,11 +4,11 @@ import { convertPdfToPages } from '../lib/pdfToPages'
 
 /**
  * Pipeline result from raw_scans.pipeline_results JSONB:
- * { status: 'created' | 'merged' | 'duplicate' | 'error' | 'processing', topic_label: string, doc_id?: string }
+ * { status: 'created' | 'merged' | 'duplicate' | 'error' | 'processing', topic_label, doc_id?, error_message? }
  */
 
 export function useUpload() {
-  // idle | converting | uploading | processing | done | error
+  // idle | converting | uploading | analyzing | clustering | done | error
   const [status, setStatus] = useState('idle')
   const [pipelineResults, setPipelineResults] = useState([])
   const [convertProgress, setConvertProgress] = useState({ current: 0, total: 0 })
@@ -41,7 +41,6 @@ export function useUpload() {
         pages = result.pages
         resolvedPageCount = result.pageCount
       } else {
-        // Single image: treat as one-page upload
         pages = [{ pageNumber: 1, blob: file, filename: 'page_001.png' }]
         resolvedPageCount = 1
         setConvertProgress({ current: 1, total: 1 })
@@ -53,7 +52,6 @@ export function useUpload() {
       setStatus('uploading')
       setUploadProgress({ current: 0, total: resolvedPageCount })
 
-      // Create raw_scans record before uploading
       const { error: dbError } = await supabase.from('raw_scans').insert({
         id: scanId,
         filename: file.name,
@@ -63,7 +61,6 @@ export function useUpload() {
       })
       if (dbError) throw dbError
 
-      // Upload meta.json
       await supabase.storage.from('raw-scans').upload(
         `${scanId}/meta.json`,
         new Blob(
@@ -72,7 +69,6 @@ export function useUpload() {
         )
       )
 
-      // Upload PNGs sequentially (avoid overloading Storage)
       for (const page of pages) {
         const { error: uploadError } = await supabase.storage
           .from('raw-scans')
@@ -81,40 +77,50 @@ export function useUpload() {
         setUploadProgress(prev => ({ ...prev, current: page.pageNumber }))
       }
 
-      // Mark as pending and trigger the pipeline
-      await supabase.from('raw_scans')
-        .update({ status: 'pending' })
-        .eq('id', scanId)
+      // ── Phase 3: OCR + Haiku analysis (Edge Function: process-ocr) ──────────
+      setStatus('analyzing')
 
-      setStatus('processing')
-
-      // Trigger orchestrator (non-blocking — Edge Function runs async)
-      supabase.functions.invoke('process-upload', {
+      const { error: ocrError } = await supabase.functions.invoke('process-ocr', {
         body: { scanId, pageCount: resolvedPageCount },
-      }).catch(err => console.warn('process-upload invoke error:', err))
+      })
+      if (ocrError) throw new Error(`OCR fehlgeschlagen: ${ocrError.message}`)
 
-      // ── Phase 3: Poll DB for live pipeline progress ─────────────────────────
+      // ── Phase 4: Clustering + DB integration (Edge Function: process-cluster) ─
+      setStatus('clustering')
+
+      // Start polling for live group results during clustering
       pollRef.current = setInterval(async () => {
         const { data } = await supabase
           .from('raw_scans')
-          .select('status, page_count, pipeline_results, error_message')
+          .select('pipeline_results')
           .eq('id', scanId)
           .single()
-
-        if (!data) return
-
-        if (data.pipeline_results) setPipelineResults(data.pipeline_results)
-
-        if (data.status === 'processed') {
-          clearInterval(pollRef.current)
-          setStatus('done')
-        } else if (data.status === 'error') {
-          clearInterval(pollRef.current)
-          setError(data.error_message || 'Verarbeitungsfehler')
-          setStatus('error')
-        }
+        if (data?.pipeline_results) setPipelineResults(data.pipeline_results)
       }, 2000)
+
+      const { error: clusterError } = await supabase.functions.invoke('process-cluster', {
+        body: { scanId },
+      })
+
+      clearInterval(pollRef.current)
+      pollRef.current = null
+
+      if (clusterError) throw new Error(`Clustering fehlgeschlagen: ${clusterError.message}`)
+
+      // Final read to get complete results
+      const { data: finalScan } = await supabase
+        .from('raw_scans')
+        .select('pipeline_results')
+        .eq('id', scanId)
+        .single()
+      if (finalScan?.pipeline_results) setPipelineResults(finalScan.pipeline_results)
+
+      setStatus('done')
     } catch (err) {
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+      }
       setError(err.message)
       setStatus('error')
     }
@@ -130,7 +136,6 @@ export function useUpload() {
     setError(null)
   }
 
-  // Derived stats from pipeline_results
   const stats = {
     total: pipelineResults.length,
     done: pipelineResults.filter(r => r.status !== 'processing').length,
