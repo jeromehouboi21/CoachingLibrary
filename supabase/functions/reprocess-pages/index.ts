@@ -135,6 +135,10 @@ async function callFunction(name: string, body: unknown): Promise<unknown> {
   return res.json()
 }
 
+// Note: callFunction is only used for analyze-page (not process-cluster).
+// process-cluster is triggered by the frontend via supabase.functions.invoke
+// so it runs with the user JWT instead of the service role key.
+
 async function pLimit<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<T[]> {
   const results: T[] = []
   let idx = 0
@@ -257,7 +261,8 @@ serve(async (req) => {
 
     const results = await pLimit(tasks, 5)
 
-    // ── Trigger clustering for each affected scan ─────────────────────────────
+    // ── Prepare ocr_results in raw_scans for each affected scan ──────────────
+    // (Clustering is triggered by the frontend so it runs with the user JWT)
     const processedScanIds = [...new Set(
       results
         .filter(r => r.success)
@@ -265,10 +270,8 @@ serve(async (req) => {
         .filter(Boolean)
     )] as string[]
 
-    const clusterResults: Record<string, unknown> = {}
     for (const sid of processedScanIds) {
       try {
-        // Build ocr_results from page_hashes analysis for this scan
         const { data: analyzedRows } = await supabase
           .from('page_hashes')
           .select('page_number, analysis')
@@ -283,13 +286,8 @@ serve(async (req) => {
         await supabase.from('raw_scans')
           .update({ status: 'ocr_complete', ocr_results: ocrResults })
           .eq('id', sid)
-
-        const clusterResult = await callFunction('process-cluster', { scanId: sid })
-        clusterResults[sid] = clusterResult
-        console.log(`[reprocess-pages] Clustering OK für scan=${sid}`)
       } catch (err) {
-        console.error(`[reprocess-pages] Clustering FEHLER scan=${sid}:`, (err as Error).message)
-        clusterResults[sid] = { error: (err as Error).message }
+        console.error(`[reprocess-pages] ocr_results update FEHLER scan=${sid}:`, (err as Error).message)
       }
     }
 
@@ -301,7 +299,8 @@ serve(async (req) => {
         success: true,
         reprocessed: successCount,
         errors: errorCount,
-        clusteredScans: processedScanIds.length,
+        // Return scan IDs so the frontend can trigger process-cluster for each
+        scanIds: processedScanIds,
       }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )

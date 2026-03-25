@@ -39,15 +39,29 @@ export function useProcessing() {
     }
   }, [])
 
+  async function _reprocessAndCluster(body) {
+    // Step 1: OCR + analyze failed pages
+    const { data, error: err } = await supabase.functions.invoke('reprocess-pages', { body })
+    if (err) throw new Error(err.message)
+
+    // Step 2: Trigger clustering for each affected scan (with user JWT — avoids 401)
+    const scanIds = data?.scanIds ?? []
+    for (const scanId of scanIds) {
+      const { error: clusterErr } = await supabase.functions.invoke('process-cluster', {
+        body: { scanId },
+      })
+      if (clusterErr) {
+        console.error(`process-cluster fehlgeschlagen für ${scanId}:`, clusterErr.message)
+      }
+    }
+  }
+
   const reprocessScan = useCallback(async (scanId) => {
     setReprocessing(true)
     setReprocessError(null)
 
     try {
-      const { error: err } = await supabase.functions.invoke('reprocess-pages', {
-        body: { scanId },
-      })
-      if (err) throw new Error(err.message)
+      await _reprocessAndCluster({ scanId })
       await loadScans()
     } catch (err) {
       setReprocessError(err.message)
@@ -61,10 +75,7 @@ export function useProcessing() {
     setReprocessError(null)
 
     try {
-      const { error: err } = await supabase.functions.invoke('reprocess-pages', {
-        body: {},
-      })
-      if (err) throw new Error(err.message)
+      await _reprocessAndCluster({})
       await loadScans()
     } catch (err) {
       setReprocessError(err.message)
