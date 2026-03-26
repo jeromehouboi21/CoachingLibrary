@@ -181,7 +181,7 @@ serve(async (req) => {
     if (!pageFilenames || pageFilenames.length === 0) throw new Error('pageFilenames fehlt im Request-Body')
 
     await supabase.from('raw_scans')
-      .update({ status: 'processing' })
+      .update({ status: 'processing', ocr_pages_done: 0 })
       .eq('id', scanId)
 
     // ── Step 1: Google Access Token ──────────────────────────────────────────
@@ -227,6 +227,8 @@ serve(async (req) => {
           .eq('scan_id', scanId!)
           .eq('page_number', pageNumber)
 
+        await supabase.rpc('increment_ocr_progress', { scan_id: scanId! })
+
         return text
       } catch (err) {
         const msg = (err as Error).message
@@ -236,6 +238,8 @@ serve(async (req) => {
           .update({ status: 'error', error_message: msg })
           .eq('scan_id', scanId!)
           .eq('page_number', pageNumber)
+
+        await supabase.rpc('increment_ocr_progress', { scan_id: scanId! })
 
         return `[Seite nicht lesbar: ${filename}]`
       }

@@ -8,15 +8,18 @@ export function useUpload() {
   const [pipelineResults, setPipelineResults] = useState([])
   const [convertProgress, setConvertProgress] = useState({ current: 0, total: 0 })
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0, skipped: 0 })
+  const [ocrProgress, setOcrProgress] = useState({ done: 0, total: 0 })
   const [pageCount, setPageCount] = useState(0)
   const [error, setError] = useState(null)
   const pollRef = useRef(null)
+  const ocrPollRef = useRef(null)
 
   async function uploadFile(file) {
     setStatus('converting')
     setPipelineResults([])
     setConvertProgress({ current: 0, total: 0 })
     setUploadProgress({ current: 0, total: 0, skipped: 0 })
+    setOcrProgress({ done: 0, total: 0 })
     setPageCount(0)
     setError(null)
 
@@ -121,16 +124,35 @@ export function useUpload() {
 
       // ── Phase 3: OCR + Haiku analysis (Edge Function: process-ocr) ──────────
       setStatus('analyzing')
+      setOcrProgress({ done: 0, total: newPageFilenames.length })
 
       // Fetch session once for both invocations — prevents 401 after long uploads
       const { data: { session } } = await supabase.auth.getSession()
       const authHeader = { Authorization: `Bearer ${session?.access_token}` }
 
-      const { error: ocrError } = await supabase.functions.invoke('process-ocr', {
-        body: { scanId, pageFilenames: newPageFilenames },
-        headers: authHeader,
-      })
-      if (ocrError) throw new Error(`OCR fehlgeschlagen: ${ocrError.message}`)
+      // Poll ocr_pages_done from DB while process-ocr runs
+      ocrPollRef.current = setInterval(async () => {
+        const { data } = await supabase
+          .from('raw_scans')
+          .select('ocr_pages_done')
+          .eq('id', scanId)
+          .single()
+        if (data?.ocr_pages_done !== undefined) {
+          setOcrProgress(prev => ({ ...prev, done: data.ocr_pages_done }))
+        }
+      }, 2000)
+
+      try {
+        const { error: ocrError } = await supabase.functions.invoke('process-ocr', {
+          body: { scanId, pageFilenames: newPageFilenames },
+          headers: authHeader,
+        })
+        if (ocrError) throw new Error(`OCR fehlgeschlagen: ${ocrError.message}`)
+      } finally {
+        clearInterval(ocrPollRef.current)
+        ocrPollRef.current = null
+        setOcrProgress(prev => ({ ...prev, done: newPageFilenames.length }))
+      }
 
       // ── Phase 4: Clustering + DB integration (Edge Function: process-cluster) ─
       // Backend self-orchestrates batches — one call triggers all batches in sequence.
@@ -178,6 +200,10 @@ export function useUpload() {
         clearInterval(pollRef.current)
         pollRef.current = null
       }
+      if (ocrPollRef.current) {
+        clearInterval(ocrPollRef.current)
+        ocrPollRef.current = null
+      }
       setError(err.message)
       setStatus('error')
     }
@@ -185,10 +211,12 @@ export function useUpload() {
 
   function reset() {
     if (pollRef.current) clearInterval(pollRef.current)
+    if (ocrPollRef.current) clearInterval(ocrPollRef.current)
     setStatus('idle')
     setPipelineResults([])
     setConvertProgress({ current: 0, total: 0 })
     setUploadProgress({ current: 0, total: 0, skipped: 0 })
+    setOcrProgress({ done: 0, total: 0 })
     setPageCount(0)
     setError(null)
   }
@@ -209,6 +237,7 @@ export function useUpload() {
     pipelineResults,
     convertProgress,
     uploadProgress,
+    ocrProgress,
     pageCount,
     stats,
     error,

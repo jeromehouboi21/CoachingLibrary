@@ -45,7 +45,7 @@ const STATUS_LABEL = {
   processing: 'In Bearbeitung',
 }
 
-function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, pipelineResults, stats }) {
+function PipelineProgress({ status, convertProgress, uploadProgress, ocrProgress, pageCount, pipelineResults, stats }) {
   const groupsTotal = pipelineResults.length
   const groupsDone = stats.done
 
@@ -91,7 +91,9 @@ function PipelineProgress({ status, convertProgress, uploadProgress, pageCount, 
           />
           <ProgressRow
             label="Phase 3 · OCR & KI-Analyse"
-            value={analyzingDone ? (pageCount > 0 ? `${pageCount}/${pageCount}` : '✓') : '…'}
+            value={ocrProgress.total > 0
+              ? `${ocrProgress.done}/${ocrProgress.total}`
+              : analyzingDone ? '✓' : '…'}
             done={analyzingDone}
           />
           <ProgressRow
@@ -163,7 +165,7 @@ function ProgressRow({ label, value, done, note }) {
 
 export default function UploadScreen() {
   const navigate = useNavigate()
-  const { uploadFile, status, pipelineResults, convertProgress, uploadProgress, pageCount, stats, error, reset } = useUpload()
+  const { uploadFile, status, pipelineResults, convertProgress, uploadProgress, ocrProgress, pageCount, stats, error, reset } = useUpload()
   const [selectedFile, setSelectedFile] = useState(null)
   const [fileError, setFileError] = useState(null)
   const [isDragOver, setIsDragOver] = useState(false)
@@ -285,6 +287,7 @@ export default function UploadScreen() {
               status={status}
               convertProgress={convertProgress}
               uploadProgress={uploadProgress}
+              ocrProgress={ocrProgress}
               pageCount={pageCount}
               pipelineResults={pipelineResults}
               stats={stats}
