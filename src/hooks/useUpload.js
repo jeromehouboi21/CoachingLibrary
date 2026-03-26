@@ -133,35 +133,44 @@ export function useUpload() {
       if (ocrError) throw new Error(`OCR fehlgeschlagen: ${ocrError.message}`)
 
       // ── Phase 4: Clustering + DB integration (Edge Function: process-cluster) ─
+      // Backend self-orchestrates batches — one call triggers all batches in sequence.
+      // Frontend polls DB for live results and waits for status = 'processed' | 'error'.
       setStatus('clustering')
 
-      // Poll for live group results during clustering
-      pollRef.current = setInterval(async () => {
-        const { data } = await supabase
-          .from('raw_scans')
-          .select('pipeline_results')
-          .eq('id', scanId)
-          .single()
-        if (data?.pipeline_results) setPipelineResults(data.pipeline_results)
-      }, 2000)
-
-      const { error: clusterError } = await supabase.functions.invoke('process-cluster', {
-        body: { scanId },
-        headers: authHeader,
+      // Promise that resolves/rejects when polling detects final pipeline status
+      const clusterDonePromise = new Promise((resolve, reject) => {
+        pollRef.current = setInterval(async () => {
+          const { data } = await supabase
+            .from('raw_scans')
+            .select('status, pipeline_results')
+            .eq('id', scanId)
+            .single()
+          if (data?.pipeline_results) setPipelineResults(data.pipeline_results)
+          if (data?.status === 'processed') {
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            resolve()
+          } else if (data?.status === 'error') {
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            reject(new Error(data?.error_message || 'Clustering fehlgeschlagen'))
+          }
+        }, 2000)
       })
 
-      clearInterval(pollRef.current)
-      pollRef.current = null
+      // Trigger first batch — backend fires subsequent batches itself (fire-and-forget)
+      const { error: clusterError } = await supabase.functions.invoke('process-cluster', {
+        body: { scanId, startIndex: 0, batchSize: 3 },
+        headers: authHeader,
+      })
+      if (clusterError) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+        throw new Error(`Clustering fehlgeschlagen: ${clusterError.message}`)
+      }
 
-      if (clusterError) throw new Error(`Clustering fehlgeschlagen: ${clusterError.message}`)
-
-      // Final read for complete results
-      const { data: finalScan } = await supabase
-        .from('raw_scans')
-        .select('pipeline_results')
-        .eq('id', scanId)
-        .single()
-      if (finalScan?.pipeline_results) setPipelineResults(finalScan.pipeline_results)
+      // Wait until all batches are done (polling resolves the promise)
+      await clusterDonePromise
 
       setStatus('done')
     } catch (err) {

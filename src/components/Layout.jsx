@@ -6,6 +6,7 @@ const navItems = [
   { to: '/search', icon: '🔍', label: 'Suche', exact: false },
   { to: '/methods', icon: '🛠', label: 'Methoden', exact: false },
   { to: '/upload', icon: '⬆️', label: 'Upload', exact: false },
+  { to: '/processing', icon: '📋', label: 'Status', exact: false },
 ]
 
 export function Layout({ children }) {

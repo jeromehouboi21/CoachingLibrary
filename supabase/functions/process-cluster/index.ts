@@ -142,41 +142,62 @@ serve(async (req) => {
   try {
     const body = await req.json()
     scanId = body.scanId
+    const startIndex: number = body.startIndex ?? 0
+    const batchSize: number = body.batchSize ?? 3
 
-    console.log('[process-cluster] gestartet', { scanId })
+    console.log('[process-cluster] gestartet', { scanId, startIndex, batchSize })
 
     if (!scanId) throw new Error('Missing required parameter: scanId')
 
-    // ── Step 1: Load OCR results from DB ─────────────────────────────────────
+    // ── Step 1: Load OCR results + existing cluster groups ───────────────────
     const { data: scan, error: scanError } = await supabase
       .from('raw_scans')
-      .select('ocr_results, filename')
+      .select('ocr_results, cluster_groups, pipeline_results, filename')
       .eq('id', scanId)
       .single()
 
     if (scanError) throw scanError
     if (!scan?.ocr_results) throw new Error('Keine OCR-Ergebnisse gefunden. process-ocr zuerst ausführen.')
 
-    const analyzedPages: AnalyzedPage[] = scan.ocr_results
     const originalFilename: string = scan.filename || 'scan.pdf'
 
-    console.log('[process-cluster]', analyzedPages.length, 'Seiten geladen, Clustering startet…')
+    // ── Step 2: Cluster (only on first call) or load saved groups ────────────
+    let pageGroups: PageGroup[]
 
-    // ── Step 2: Cluster pages by embedding similarity ─────────────────────────
-    const pageGroups = clusterByEmbedding(analyzedPages, 0.82)
-    console.log('[process-cluster] Clustering →', pageGroups.length, 'Gruppen')
+    if (startIndex === 0) {
+      const analyzedPages: AnalyzedPage[] = scan.ocr_results
+      console.log('[process-cluster]', analyzedPages.length, 'Seiten geladen, Clustering startet…')
 
-    const pipelineResults: PipelineResult[] = pageGroups.map(g => ({
-      status: 'processing',
+      pageGroups = clusterByEmbedding(analyzedPages, 0.82)
+      console.log('[process-cluster] Clustering →', pageGroups.length, 'Gruppen')
+
+      // Save groups + initial pipeline_results for subsequent calls
+      const initialResults: PipelineResult[] = pageGroups.map(g => ({
+        status: 'processing',
+        topic_label: g.topic_label,
+      }))
+
+      await supabase.from('raw_scans')
+        .update({ status: 'processing', cluster_groups: pageGroups, pipeline_results: initialResults })
+        .eq('id', scanId)
+    } else {
+      if (!scan?.cluster_groups) throw new Error('cluster_groups fehlt – startIndex > 0 erfordert vorherigen Aufruf mit startIndex=0')
+      pageGroups = scan.cluster_groups as PageGroup[]
+      console.log('[process-cluster] Gruppen aus DB geladen:', pageGroups.length)
+    }
+
+    // Accumulate pipeline_results across batches
+    const pipelineResults: PipelineResult[] = (scan?.pipeline_results as PipelineResult[]) ?? pageGroups.map(g => ({
+      status: 'processing' as const,
       topic_label: g.topic_label,
     }))
 
-    await supabase.from('raw_scans')
-      .update({ status: 'processing', pipeline_results: pipelineResults })
-      .eq('id', scanId)
+    // ── Step 3: Process only the current batch ────────────────────────────────
+    const batchEnd = Math.min(startIndex + batchSize, pageGroups.length)
+    console.log(`[process-cluster] Batch: Gruppen ${startIndex}–${batchEnd - 1} von ${pageGroups.length}`)
 
-    // ── Step 3: For each group → find merge candidate → merge or create ───────
-    for (let gi = 0; gi < pageGroups.length; gi++) {
+    for (let i = 0; i < batchEnd - startIndex; i++) {
+      const gi = startIndex + i
       const group = pageGroups[gi]
 
       try {
@@ -243,12 +264,29 @@ serve(async (req) => {
         .eq('id', scanId)
     }
 
-    await supabase.from('raw_scans').update({ status: 'processed' }).eq('id', scanId)
+    const nextIndex = batchEnd < pageGroups.length ? batchEnd : null
 
-    console.log('[process-cluster] abgeschlossen:', pipelineResults.length, 'Gruppen')
+    if (nextIndex !== null) {
+      // Fire-and-forget: trigger next batch without awaiting (self-orchestration)
+      // This allows the current response to return immediately while the pipeline continues
+      const nextUrl = `${Deno.env.get('SUPABASE_URL')}/functions/v1/process-cluster`
+      fetch(nextUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')}`,
+        },
+        body: JSON.stringify({ scanId, startIndex: nextIndex, batchSize }),
+      }).catch(err => console.error('[process-cluster] Next batch trigger failed:', err.message))
+
+      console.log(`[process-cluster] Nächster Batch getriggert: startIndex=${nextIndex}`)
+    } else {
+      await supabase.from('raw_scans').update({ status: 'processed' }).eq('id', scanId)
+      console.log('[process-cluster] alle Gruppen verarbeitet – fertig')
+    }
 
     return new Response(
-      JSON.stringify({ success: true, groups: pageGroups.length, results: pipelineResults }),
+      JSON.stringify({ success: true, batchProcessed: batchEnd - startIndex, nextIndex, totalGroups: pageGroups.length }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
   } catch (error) {
