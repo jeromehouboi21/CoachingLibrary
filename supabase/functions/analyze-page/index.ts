@@ -28,13 +28,19 @@ serve(async (req) => {
       fileName: string
     }
 
-    const response = await anthropic.messages.create({
+    const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-haiku-4-5',
       max_tokens: 2048,
       system: `Du verarbeitest eine Seite aus Coaching-Seminarmaterialien (OCR-extrahiert).
 Deine Aufgabe: Thema identifizieren und Inhalt vollständig strukturieren.
 Kürze nichts. Behalte alle Details, Übungen, Beispiele und Definitionen.
-Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.`,
+Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.
+
+WICHTIG für die JSON-Ausgabe:
+- Deutsche Anführungszeichen (« » „ " " ‚ ' ') als normale ASCII-Anführungszeichen schreiben: "
+- Verwende in content_html nur einfache Anführungszeichen für HTML-Attribute: <p class='x'>
+- Keine echten Zeilenumbrüche im JSON-String – Zeilenumbrüche als \\n schreiben
+- Die gesamte Antwort muss valides JSON sein das JSON.parse() ohne Fehler besteht`,
       messages: [{
         role: 'user',
         content: `=== SEITE ${page} (aus: ${fileName}) ===
@@ -49,13 +55,10 @@ JSON-Format:
   "key_concepts": ["Begriff1", "Begriff2", "Begriff3"]
 }`
       }]
-    })
+    }))
 
     const rawText = (response.content[0] as { type: string; text: string }).text
-    const match = rawText.match(/\{[\s\S]*\}/)
-    if (!match) throw new Error('No JSON in Haiku response')
-
-    const result: AnalyzedPage = { page, ...JSON.parse(match[0]) }
+    const result: AnalyzedPage = { page, ...parseClaudeJson(rawText) }
 
     // Generate embedding for topic_embedding_text
     if (Deno.env.get('OPENAI_API_KEY') && result.topic_embedding_text) {
@@ -84,3 +87,72 @@ JSON-Format:
     )
   }
 })
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3,
+  baseDelayMs = 10000
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      const message = (error as Error).message ?? ''
+      const isRateLimit = message.includes('429') || message.includes('rate_limit')
+
+      if (isRateLimit && attempt < maxRetries) {
+        const delay = baseDelayMs * Math.pow(2, attempt)
+        console.warn(
+          `[analyze-page] Rate limit – warte ${delay / 1000}s ` +
+          `(Versuch ${attempt + 1}/${maxRetries})`
+        )
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+
+      throw error
+    }
+  }
+  throw new Error('withRetry: maximale Versuche erreicht')
+}
+
+function parseClaudeJson(raw: string): Record<string, unknown> {
+  let cleaned = raw
+    .replace(/^```json\s*/m, '')
+    .replace(/^```\s*/m, '')
+    .replace(/```\s*$/m, '')
+    .trim()
+
+  const match = cleaned.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error('Kein JSON-Objekt in Claude-Antwort gefunden')
+  cleaned = match[0]
+
+  // Versuch 1: Direktes Parsen
+  try { return JSON.parse(cleaned) } catch (_) { /* weiter */ }
+
+  // Versuch 2: Typografische Anführungszeichen ersetzen
+  try {
+    const step2 = cleaned
+      .replace(/\u201E/g, '\\"')  // „  deutsches öffnendes Anführungszeichen
+      .replace(/\u201C/g, '\\"')  // "  englisches öffnendes Anführungszeichen
+      .replace(/\u201D/g, '\\"')  // "  englisches schließendes Anführungszeichen
+      .replace(/\u201A/g, "\\'")  // ‚  einfaches öffnendes Anführungszeichen
+      .replace(/\u2018/g, "\\'")  // '  einfaches öffnendes Anführungszeichen
+      .replace(/\u2019/g, "\\'")  // '  einfaches schließendes Anführungszeichen
+    return JSON.parse(step2)
+  } catch (_) { /* weiter */ }
+
+  // Versuch 3: Aggressivere Bereinigung
+  try {
+    const step3 = cleaned
+      .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+      .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+      .replace(/\r?\n/g, '\\n')
+      .replace(/\t/g, '\\t')
+    return JSON.parse(step3)
+  } catch (finalError) {
+    console.error('[parseClaudeJson] Parse endgültig fehlgeschlagen:', (finalError as Error).message)
+    console.error('[parseClaudeJson] Erste 300 Zeichen der Antwort:', raw.slice(0, 300))
+    throw finalError
+  }
+}

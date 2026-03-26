@@ -267,7 +267,18 @@ serve(async (req) => {
         return result
       } catch (err) {
         const msg = (err as Error).message
-        console.error(`[process-ocr] analyze-page FEHLER Seite ${i + 1}:`, msg)
+        const isRateLimit = msg.includes('429') || msg.includes('rate_limit')
+
+        const errorMessage = isRateLimit
+          ? `Rate Limit erreicht – bitte erneut verarbeiten (${msg.slice(0, 100)})`
+          : msg
+
+        console.error(`[process-ocr] analyze-page FEHLER Seite ${i + 1}:`, errorMessage)
+
+        await supabase.from('page_hashes')
+          .update({ status: 'error', error_message: errorMessage })
+          .eq('scan_id', scanId!)
+          .eq('page_number', pageNumber)
 
         const fallback: AnalyzedPage = {
           page: i + 1,
@@ -278,16 +289,11 @@ serve(async (req) => {
           key_concepts: [],
         }
 
-        await supabase.from('page_hashes')
-          .update({ analysis: fallback, error_message: msg })
-          .eq('scan_id', scanId!)
-          .eq('page_number', pageNumber)
-
         return fallback
       }
     })
 
-    const analyzedPages = (await pLimit(analyzeTasks, 5)) as AnalyzedPage[]
+    const analyzedPages = (await pLimit(analyzeTasks, 3)) as AnalyzedPage[]
 
     console.log('[process-ocr] abgeschlossen:', analyzedPages.length, 'Seiten analysiert')
 

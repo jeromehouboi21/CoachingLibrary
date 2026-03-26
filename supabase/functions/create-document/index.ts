@@ -37,6 +37,7 @@ Fasse NICHTS zusammen oder kürze NICHTS – integriere den vollständigen Inhal
 Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.
 
 WICHTIG für die JSON-Ausgabe:
+- Deutsche Anführungszeichen (« » „ " " ‚ ' ') als normale ASCII-Anführungszeichen schreiben: "
 - Verwende in content_html ausschließlich einfache Anführungszeichen für HTML-Attribute: <p class='x'> statt <p class="x">
 - Alle doppelten Anführungszeichen innerhalb von Texten müssen als \\" escaped werden
 - Zeilenumbrüche im content_html als \\n schreiben, nicht als echte Zeilenumbrüche
@@ -59,10 +60,7 @@ JSON-Format:
     })
 
     const rawText = (response.content[0] as { type: string; text: string }).text
-    const match = rawText.match(/\{[\s\S]*\}/)
-    if (!match) throw new Error('No JSON in Sonnet response')
-
-    const doc = parseClaudeJson(match[0])
+    const doc = parseClaudeJson(rawText)
     const contentText = doc.content_html?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || ''
 
     // Generate summary embedding
@@ -146,42 +144,43 @@ JSON-Format:
 })
 
 function parseClaudeJson(raw: string): Record<string, unknown> {
-  // 1. Remove accidental markdown fences
-  const cleaned = raw
+  let cleaned = raw
     .replace(/^```json\s*/m, '')
     .replace(/^```\s*/m, '')
     .replace(/```\s*$/m, '')
     .trim()
 
-  // 2. Direct parse attempt
+  const match = cleaned.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error('Kein JSON-Objekt in Claude-Antwort gefunden')
+  cleaned = match[0]
+
+  // Versuch 1: Direktes Parsen
+  try { return JSON.parse(cleaned) } catch (_) { /* weiter */ }
+
+  // Versuch 2: Typografische Anführungszeichen ersetzen
   try {
-    return JSON.parse(cleaned)
-  } catch (firstError) {
-    // 3. Fallback: escape unescaped double-quotes inside content_html value
-    try {
-      const fixed = cleaned.replace(
-        /("content_html"\s*:\s*")([\s\S]*?)("(?:\s*[,}]))/,
-        (_match, prefix, html, suffix) => {
-          // Escape any unescaped double-quotes inside the HTML string
-          const safeHtml = html.replace(/(?<!\\)"/g, '\\"')
-          return `${prefix}${safeHtml}${suffix}`
-        }
-      )
-      return JSON.parse(fixed)
-    } catch (secondError) {
-      // 4. Last resort: return a placeholder document so the group is not lost
-      console.error('[create-document] JSON parse failed:', (firstError as Error).message)
-      console.error('[create-document] Raw response (first 500 chars):', raw.slice(0, 500))
-      return {
-        title: 'Dokument konnte nicht verarbeitet werden',
-        summary: 'JSON-Parsing fehlgeschlagen. Bitte den Scan erneut hochladen.',
-        category: 'Grundlagen',
-        subcategory: 'Unbekannt',
-        tags: ['fehler', 'reprocessing-needed'],
-        difficulty: 'Grundlagen',
-        content_html: '<p>Inhalt konnte nicht extrahiert werden.</p>',
-      }
-    }
+    const step2 = cleaned
+      .replace(/\u201E/g, '\\"')  // „  deutsches öffnendes Anführungszeichen
+      .replace(/\u201C/g, '\\"')  // "  englisches öffnendes Anführungszeichen
+      .replace(/\u201D/g, '\\"')  // "  englisches schließendes Anführungszeichen
+      .replace(/\u201A/g, "\\'")  // ‚  einfaches öffnendes Anführungszeichen
+      .replace(/\u2018/g, "\\'")  // '  einfaches öffnendes Anführungszeichen
+      .replace(/\u2019/g, "\\'")  // '  einfaches schließendes Anführungszeichen
+    return JSON.parse(step2)
+  } catch (_) { /* weiter */ }
+
+  // Versuch 3: Aggressivere Bereinigung
+  try {
+    const step3 = cleaned
+      .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+      .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+      .replace(/\r?\n/g, '\\n')
+      .replace(/\t/g, '\\t')
+    return JSON.parse(step3)
+  } catch (finalError) {
+    console.error('[parseClaudeJson] Parse endgültig fehlgeschlagen:', (finalError as Error).message)
+    console.error('[parseClaudeJson] Erste 300 Zeichen der Antwort:', raw.slice(0, 300))
+    throw finalError
   }
 }
 
