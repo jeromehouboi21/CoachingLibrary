@@ -90,8 +90,8 @@ JSON-Format:
 
 async function withRetry<T>(
   fn: () => Promise<T>,
-  maxRetries = 3,
-  baseDelayMs = 10000
+  maxRetries = 2,
+  baseDelayMs = 3000
 ): Promise<T> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -117,6 +117,10 @@ async function withRetry<T>(
 }
 
 function parseClaudeJson(raw: string): Record<string, unknown> {
+  if (!raw || raw.trim().length === 0) {
+    throw new Error('Claude hat eine leere Antwort zurückgegeben')
+  }
+
   let cleaned = raw
     .replace(/^```json\s*/m, '')
     .replace(/^```\s*/m, '')
@@ -124,7 +128,16 @@ function parseClaudeJson(raw: string): Record<string, unknown> {
     .trim()
 
   const match = cleaned.match(/\{[\s\S]*\}/)
-  if (!match) throw new Error('Kein JSON-Objekt in Claude-Antwort gefunden')
+  if (!match) {
+    console.error(
+      '[parseClaudeJson] Kein JSON gefunden.',
+      `Antwortlänge: ${raw.length}`,
+      `Anfang: "${raw.slice(0, 100)}"`
+    )
+    throw new Error(
+      `Kein JSON in Claude-Antwort (Länge: ${raw.length}, Anfang: "${raw.slice(0, 50)}")`
+    )
+  }
   cleaned = match[0]
 
   // Versuch 1: Direktes Parsen
