@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { useChat } from '../../hooks/useChat'
 import { SourceCard } from '../../components/SourceCard'
 
@@ -14,8 +15,19 @@ function MessageBubble({ message }) {
   return (
     <div className={`chat-message chat-message--${isUser ? 'user' : 'assistant'}`}>
       <div className="chat-bubble">
-        {text || (message.streaming ? '' : '…')}
-        {message.streaming && text && <span className="chat-cursor" aria-hidden="true" />}
+        {isUser ? (
+          <>
+            {text || (message.streaming ? '' : '…')}
+          </>
+        ) : (
+          <>
+            <div className="chat-message-content">
+              <ReactMarkdown>{text || (message.streaming ? '' : '…')}</ReactMarkdown>
+            </div>
+            {message.streaming && text && <span className="chat-cursor" aria-hidden="true" />}
+          </>
+        )}
+        {isUser && message.streaming && text && <span className="chat-cursor" aria-hidden="true" />}
       </div>
       {!isUser && !message.streaming && message.sources && message.sources.length > 0 && (
         <div className="chat-sources">

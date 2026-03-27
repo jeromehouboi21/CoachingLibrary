@@ -931,6 +931,67 @@ h1, h2, h3, h4, h5, h6 {
   50% { opacity: 0; }
 }
 
+/* Chat Markdown Rendering */
+.chat-message-content h1,
+.chat-message-content h2,
+.chat-message-content h3 {
+  font-family: 'DM Serif Display', Georgia, serif;
+  color: var(--color-ink);
+  margin-top: 1rem;
+  margin-bottom: 0.4rem;
+  line-height: 1.3;
+}
+
+.chat-message-content h1 { font-size: 1.2rem; }
+.chat-message-content h2 { font-size: 1.05rem; }
+.chat-message-content h3 { font-size: 0.95rem; }
+
+.chat-message-content p {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.9rem;
+  color: var(--color-ink);
+  margin-bottom: 0.6rem;
+  line-height: 1.6;
+}
+
+.chat-message-content ul,
+.chat-message-content ol {
+  padding-left: 1.25rem;
+  margin-bottom: 0.6rem;
+}
+
+.chat-message-content li {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.9rem;
+  color: var(--color-ink);
+  line-height: 1.6;
+  margin-bottom: 0.2rem;
+}
+
+.chat-message-content strong {
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.chat-message-content em {
+  font-style: italic;
+  color: var(--color-ink-2);
+}
+
+.chat-message-content hr {
+  border: none;
+  border-top: 1px solid var(--color-accent-light);
+  margin: 0.75rem 0;
+}
+
+.chat-message-content > *:first-child {
+  margin-top: 0;
+}
+
+.chat-message-content > *:last-child {
+  margin-bottom: 0;
+}
+
 /* ============================================================
    Document Reader
    ============================================================ */
