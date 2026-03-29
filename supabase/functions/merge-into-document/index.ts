@@ -33,7 +33,7 @@ serve(async (req) => {
 
     if (fetchError) throw fetchError
 
-    const response = await anthropic.messages.create({
+    const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 8192,
       system: `Du integrierst neuen Inhalt in ein bestehendes Wissensdokument.
@@ -43,7 +43,13 @@ Für "append": Füge den neuen Inhalt als neuen Abschnitt am Ende ein.
 Für "deepen": Finde den passenden bestehenden Abschnitt und integriere den neuen Inhalt dort – ohne bestehenden Inhalt zu entfernen.
 
 Kürze und entferne NICHTS aus dem bestehenden Dokument.
-Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.`,
+Antworte ausschließlich als valides JSON, keine Einleitung, kein Markdown.
+
+WICHTIG für die JSON-Ausgabe:
+- Deutsche Anführungszeichen (« » „ " " ‚ ' ') als normale ASCII-Anführungszeichen schreiben: "
+- Verwende in content_html nur einfache Anführungszeichen für HTML-Attribute: <p class='x'>
+- Keine echten Zeilenumbrüche im JSON-String – Zeilenumbrüche als \\n schreiben
+- Die gesamte Antwort muss valides JSON sein das JSON.parse() ohne Fehler besteht`,
       messages: [{
         role: 'user',
         content: `BESTEHENDES DOKUMENT:
@@ -60,13 +66,10 @@ JSON-Format:
   "summary": "aktualisierte Zusammenfassung (2-3 Sätze)"
 }`
       }]
-    })
+    }))
 
     const rawText = (response.content[0] as { type: string; text: string }).text
-    const match = rawText.match(/\{[\s\S]*\}/)
-    if (!match) throw new Error('No JSON in Sonnet response')
-
-    const merged = JSON.parse(match[0])
+    const merged = parseClaudeJson(rawText)
     const contentText = merged.content_html?.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || ''
 
     // Generate new summary embedding
@@ -132,6 +135,91 @@ JSON-Format:
     )
   }
 })
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 2,
+  baseDelayMs = 3000
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      const message = (error as Error).message ?? ''
+      const isRateLimit =
+        message.includes('429') ||
+        message.includes('rate_limit') ||
+        message.includes('529') ||
+        message.includes('overloaded')
+
+      if (isRateLimit && attempt < maxRetries) {
+        const delay = baseDelayMs * Math.pow(2, attempt)
+        console.warn(
+          `[merge-into-document] Rate limit / Overloaded – warte ${delay / 1000}s ` +
+          `(Versuch ${attempt + 1}/${maxRetries})`
+        )
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      throw error
+    }
+  }
+  throw new Error('withRetry: maximale Versuche erreicht')
+}
+
+function parseClaudeJson(raw: string): Record<string, unknown> {
+  if (!raw || raw.trim().length === 0) {
+    throw new Error('Claude hat eine leere Antwort zurückgegeben')
+  }
+
+  let cleaned = raw
+    .replace(/^```json\s*/m, '')
+    .replace(/^```\s*/m, '')
+    .replace(/```\s*$/m, '')
+    .trim()
+
+  const match = cleaned.match(/\{[\s\S]*\}/)
+  if (!match) {
+    console.error(
+      '[parseClaudeJson] Kein JSON gefunden.',
+      `Antwortlänge: ${raw.length}`,
+      `Anfang: "${raw.slice(0, 100)}"`
+    )
+    throw new Error(
+      `Kein JSON in Claude-Antwort (Länge: ${raw.length}, Anfang: "${raw.slice(0, 50)}")`
+    )
+  }
+  cleaned = match[0]
+
+  // Versuch 1: Direktes Parsen
+  try { return JSON.parse(cleaned) } catch (_) { /* weiter */ }
+
+  // Versuch 2: Typografische Anführungszeichen ersetzen
+  try {
+    const step2 = cleaned
+      .replace(/\u201E/g, '\\"')  // „  deutsches öffnendes Anführungszeichen
+      .replace(/\u201C/g, '\\"')  // "  englisches öffnendes Anführungszeichen
+      .replace(/\u201D/g, '\\"')  // "  englisches schließendes Anführungszeichen
+      .replace(/\u201A/g, "\\'")  // ‚  einfaches öffnendes Anführungszeichen
+      .replace(/\u2018/g, "\\'")  // '  einfaches öffnendes Anführungszeichen
+      .replace(/\u2019/g, "\\'")  // '  einfaches schließendes Anführungszeichen
+    return JSON.parse(step2)
+  } catch (_) { /* weiter */ }
+
+  // Versuch 3: Aggressivere Bereinigung
+  try {
+    const step3 = cleaned
+      .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+      .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+      .replace(/\r?\n/g, '\\n')
+      .replace(/\t/g, '\\t')
+    return JSON.parse(step3)
+  } catch (finalError) {
+    console.error('[parseClaudeJson] Parse endgültig fehlgeschlagen:', (finalError as Error).message)
+    console.error('[parseClaudeJson] Erste 300 Zeichen der Antwort:', raw.slice(0, 300))
+    throw finalError
+  }
+}
 
 function splitIntoChunks(text: string, chunkSize: number): string[] {
   const words = text.split(/\s+/).filter(w => w.length > 0)

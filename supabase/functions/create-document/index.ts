@@ -28,7 +28,7 @@ serve(async (req) => {
       .map((p, i) => `ABSCHNITT ${i + 1} (Seite ${p.page}):\n${p.content_html}`)
       .join('\n\n')
 
-    const response = await anthropic.messages.create({
+    const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 8192,
       system: `Du erstellst ein Wissensdokument für eine persönliche Coaching-Wissensbibliothek.
@@ -57,7 +57,7 @@ JSON-Format:
   "content_html": "vollständiger strukturierter HTML-Inhalt"
 }`
       }]
-    })
+    }))
 
     const rawText = (response.content[0] as { type: string; text: string }).text
     const doc = parseClaudeJson(rawText)
@@ -142,6 +142,37 @@ JSON-Format:
     )
   }
 })
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 2,
+  baseDelayMs = 3000
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (error) {
+      const message = (error as Error).message ?? ''
+      const isRateLimit =
+        message.includes('429') ||
+        message.includes('rate_limit') ||
+        message.includes('529') ||
+        message.includes('overloaded')
+
+      if (isRateLimit && attempt < maxRetries) {
+        const delay = baseDelayMs * Math.pow(2, attempt)
+        console.warn(
+          `[create-document] Rate limit / Overloaded – warte ${delay / 1000}s ` +
+          `(Versuch ${attempt + 1}/${maxRetries})`
+        )
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      throw error
+    }
+  }
+  throw new Error('withRetry: maximale Versuche erreicht')
+}
 
 function parseClaudeJson(raw: string): Record<string, unknown> {
   let cleaned = raw

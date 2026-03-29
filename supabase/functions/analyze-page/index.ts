@@ -98,7 +98,11 @@ async function withRetry<T>(
       return await fn()
     } catch (error) {
       const message = (error as Error).message ?? ''
-      const isRateLimit = message.includes('429') || message.includes('rate_limit')
+      const isRateLimit =
+        message.includes('429') ||
+        message.includes('rate_limit') ||
+        message.includes('529') ||
+        message.includes('overloaded')
 
       if (isRateLimit && attempt < maxRetries) {
         const delay = baseDelayMs * Math.pow(2, attempt)
